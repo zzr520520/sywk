@@ -321,7 +321,25 @@ static NSTimeInterval g_lastTapTime = 0; // 防抖时间戳
     if (now - g_lastTapTime < 0.5) return;
     g_lastTapTime = now;
 
-    UIWindow *targetWindow = [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
+    // 兼容 iOS 13+ 获取 keyWindow 的方式
+    UIWindow *targetWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *windowScene = (UIWindowScene *)scene;
+                for (UIWindow *w in windowScene.windows) {
+                    if (w.isKeyWindow) {
+                        targetWindow = w;
+                        break;
+                    }
+                }
+                if (targetWindow) break;
+            }
+        }
+    }
+    if (!targetWindow) {
+        targetWindow = [UIApplication sharedApplication].windows.firstObject;
+    }
 
     if (!g_menuView) {
         g_menuView = [[BattleFullMenuView alloc] initWithFrame:CGRectMake(20, 100, 275, 245)];
