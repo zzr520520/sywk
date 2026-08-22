@@ -2,7 +2,7 @@
 #import <substrate.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
-#import <cmath>
+#import <math.h>
 
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
