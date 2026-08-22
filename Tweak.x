@@ -1,7 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 
-// ---------------------- 全局参数与状态 ----------------------
 typedef enum : NSUInteger {
     AudioMode_Normal = 0,
     AudioMode_NewFight,   // 新清晰搏击
@@ -13,91 +12,96 @@ static BOOL kForceOpenMic = NO;
 static BOOL kDoubleVoice = NO;
 static AudioFightMode kCurrentMode = AudioMode_NewFight;
 
-// 动态调试参数 (可在调试页实时拖动)
-static float kDebugGain = 400.0f;       // 采集音量增益
-static float kDebugBassGain = 8.0f;     // 低频打击感 (125Hz)
-static float kDebugClarityGain = 10.0f; // 高频清晰度 (4kHz)
-static float kDebugEchoGain = 40.0f;    // 双音回声强度
+static float kDebugGain = 400.0f;
+static float kDebugBassGain = 8.0f;
+static float kDebugClarityGain = 10.0f;
 
 static __weak id g_activeZegoApi = nil;
 
-@interface NSObject (ZegoSDKDeclarations)
+@interface NSObject (ZegoSafeDeclarations)
 - (bool)setCaptureVolume:(int)volume;
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
 - (bool)enableMic:(bool)enable;
-- (bool)setReverbEchoParam:(id)param;
 - (bool)enableReverb:(bool)enable;
+- (bool)setReverbPreset:(int)preset;
 @end
 
-// ---------------------- 核心音频流矩阵调度 ----------------------
+// ---------------------- 安全音频矩阵应用 ----------------------
 static void SyncGlobalAudioMatrix(id zegoApi) {
     if (!zegoApi) return;
 
     // 1. 强制开麦
-    if (kForceOpenMic) {
+    if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) {
         [zegoApi enableMic:YES];
     }
 
-    // 2. 双音效果（上传给房间所有人听到）
-    // 利用运行时动态构建 ZegoReverbEchoParam 回声回响对象推流
+    // 2. 双音/混响效果（使用原生安全预设，杜绝 KVC 崩溃）
     if (kDoubleVoice) {
-        Class echoCls = NSClassFromString(@"ZegoReverbEchoParam");
-        if (echoCls) {
-            id echoParam = [[echoCls alloc] init];
-            // 配置全房间可听的双重音质感
-            @try {
-                [echoParam setValue:@(kDebugEchoGain / 100.0f) forKey:@"inGain"];
-                [echoParam setValue:@(0.6f) forKey:@"outGain"];
-                [echoParam setValue:@(120) forKey:@"delay"]; // 120ms 延时，产生明显双重声
-                [echoParam setValue:@(0.5f) forKey:@"decay"];
-                [zegoApi setReverbEchoParam:echoParam];
-            } @catch (NSException *e) {}
+        if ([zegoApi respondsToSelector:@selector(enableReverb:)]) {
+            [zegoApi enableReverb:YES];
+        }
+        // 预设模式：2 为 KTV/混响双音回响模式
+        if ([zegoApi respondsToSelector:@selector(setReverbPreset:)]) {
+            [zegoApi setReverbPreset:2];
         }
     } else {
-        [zegoApi setReverbEchoParam:nil];
+        if ([zegoApi respondsToSelector:@selector(enableReverb:)]) {
+            [zegoApi enableReverb:NO];
+        }
     }
 
-    // 3. 战斗/搏击/调试调音模式注入
+    // 3. 战斗音效与增益
     if (kCurrentMode == AudioMode_Normal) {
-        [zegoApi enableAGC:YES];
-        [zegoApi enableNoiseSuppress:YES];
-        [zegoApi setCaptureVolume:100];
-        for (int i = 0; i < 10; i++) {
-            [zegoApi setAudioEqualizerGain:0.0f index:i];
+        if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
+        if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
+        if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
+        if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
+            @try {
+                for (int i = 0; i < 10; i++) {
+                    [zegoApi setAudioEqualizerGain:0.0f index:i];
+                }
+            } @catch (NSException *e) {}
         }
         return;
     }
 
-    // 只要开启任一战斗模式，强制抹杀 3A 压制
-    [zegoApi enableAGC:NO];
-    [zegoApi enableNoiseSuppress:NO];
+    // 关闭 3A 压制
+    if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
+    if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
 
-    if (kCurrentMode == AudioMode_NewFight) {
-        [zegoApi setCaptureVolume:(int)kDebugGain];
-        [zegoApi setAudioEqualizerGain:2.0f index:2];
-        [zegoApi setAudioEqualizerGain:-6.0f index:4]; // 压低浑浊
-        [zegoApi setAudioEqualizerGain:8.0f index:6];
-        [zegoApi setAudioEqualizerGain:kDebugClarityGain index:7]; // 极高咬字清晰
-    } else if (kCurrentMode == AudioMode_OldFight) {
-        [zegoApi setCaptureVolume:(int)kDebugGain];
-        [zegoApi setAudioEqualizerGain:kDebugBassGain index:2];    // 重低频爆发
-        [zegoApi setAudioEqualizerGain:5.0f index:3];
-        [zegoApi setAudioEqualizerGain:-2.0f index:4];
-        [zegoApi setAudioEqualizerGain:6.0f index:6];
-        [zegoApi setAudioEqualizerGain:7.0f index:7];
-    } else if (kCurrentMode == AudioMode_SuperFight) {
-        [zegoApi setCaptureVolume:650]; // 极限音量轰炸
-        [zegoApi setAudioEqualizerGain:12.0f index:2];
-        [zegoApi setAudioEqualizerGain:5.0f index:5];
-        [zegoApi setAudioEqualizerGain:10.0f index:6];
-        [zegoApi setAudioEqualizerGain:12.0f index:7];
+    // 安全设置音量
+    if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) {
+        int targetGain = (kCurrentMode == AudioMode_SuperFight) ? 600 : (int)kDebugGain;
+        [zegoApi setCaptureVolume:targetGain];
+    }
+
+    // 安全设置 EQ（@try 防止底层断言崩溃）
+    if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
+        @try {
+            if (kCurrentMode == AudioMode_NewFight) {
+                [zegoApi setAudioEqualizerGain:2.0f index:2];
+                [zegoApi setAudioEqualizerGain:-4.0f index:4];
+                [zegoApi setAudioEqualizerGain:8.0f index:6];
+                [zegoApi setAudioEqualizerGain:kDebugClarityGain index:7];
+            } else if (kCurrentMode == AudioMode_OldFight) {
+                [zegoApi setAudioEqualizerGain:kDebugBassGain index:2];
+                [zegoApi setAudioEqualizerGain:4.0f index:3];
+                [zegoApi setAudioEqualizerGain:-2.0f index:4];
+                [zegoApi setAudioEqualizerGain:6.0f index:6];
+                [zegoApi setAudioEqualizerGain:7.0f index:7];
+            } else if (kCurrentMode == AudioMode_SuperFight) {
+                [zegoApi setAudioEqualizerGain:10.0f index:2];
+                [zegoApi setAudioEqualizerGain:4.0f index:5];
+                [zegoApi setAudioEqualizerGain:8.0f index:6];
+                [zegoApi setAudioEqualizerGain:10.0f index:7];
+            }
+        } @catch (NSException *e) {}
     }
 }
 
-// ---------------------- Hook 业务层与 SDK ----------------------
-// 1. Hook 应用业务管理器 SKAudioZegoManager，防止上麦重置参数
+// ---------------------- Hook 业务层 SKAudioZegoManager ----------------------
 %hook SKAudioZegoManager
 
 - (void)enableMic:(BOOL)enable {
@@ -106,15 +110,15 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
     } else {
         %orig(enable);
     }
-    // 上麦完成后强行刷新参数
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // 上麦完成后延迟刷新参数
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         SyncGlobalAudioMatrix(g_activeZegoApi);
     });
 }
 
 %end
 
-// 2. Hook 底层 ZegoLiveRoomApi
+// ---------------------- Hook Zego 核心 API ----------------------
 %hook ZegoLiveRoomApi
 
 - (id)init {
@@ -126,7 +130,7 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
 - (bool)setCaptureVolume:(int)volume {
     g_activeZegoApi = self;
     if (kCurrentMode != AudioMode_Normal) {
-        int v = (kCurrentMode == AudioMode_SuperFight) ? 650 : (int)kDebugGain;
+        int v = (kCurrentMode == AudioMode_SuperFight) ? 600 : (int)kDebugGain;
         return %orig(v);
     }
     return %orig(volume);
@@ -144,31 +148,38 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
     return %orig(enable);
 }
 
+// 推流建立后延迟注入，防止底层音频引擎未就绪导致崩溃
 - (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo {
     g_activeZegoApi = self;
     bool res = %orig;
-    SyncGlobalAudioMatrix(self);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SyncGlobalAudioMatrix(self);
+    });
     return res;
 }
 
 - (bool)startPublishing2:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo params:(NSString *)params channelIndex:(int)channelIndex {
     g_activeZegoApi = self;
     bool res = %orig;
-    SyncGlobalAudioMatrix(self);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SyncGlobalAudioMatrix(self);
+    });
     return res;
 }
 
 - (bool)startPublishWithParams:(id)params {
     g_activeZegoApi = self;
     bool res = %orig;
-    SyncGlobalAudioMatrix(self);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SyncGlobalAudioMatrix(self);
+    });
     return res;
 }
 
 %end
 
-// ---------------------- 完整 UI 面板（含调试/功能切换） ----------------------
-@interface BattleMasterHUD : UIView
+// ---------------------- 浮窗与控制交互 ----------------------
+@interface SafeHUDView : UIView
 @property (nonatomic, strong) UIView *funcPageView;
 @property (nonatomic, strong) UIView *debugPageView;
 @property (nonatomic, strong) UISwitch *swForceMic;
@@ -178,7 +189,7 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
 @property (nonatomic, strong) UISwitch *swSuperFight;
 @end
 
-@implementation BattleMasterHUD
+@implementation SafeHUDView
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
@@ -190,7 +201,7 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
         [self addGestureRecognizer:pan];
 
-        // 1. 左侧 Tab 栏
+        // 左侧栏
         UIView *leftTab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 75, frame.size.height)];
         leftTab.backgroundColor = [UIColor colorWithRed:0.75 green:0.88 blue:1.0 alpha:0.96];
         [self addSubview:leftTab];
@@ -209,7 +220,7 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
             [leftTab addSubview:btn];
         }
 
-        // 2. 右侧面板容器
+        // 右侧容器
         CGFloat rightW = frame.size.width - 75;
         self.funcPageView = [[UIView alloc] initWithFrame:CGRectMake(75, 0, rightW, frame.size.height)];
         self.funcPageView.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.92];
@@ -220,14 +231,13 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
         self.debugPageView.hidden = YES;
         [self addSubview:self.debugPageView];
 
-        [self setupFuncPage];
-        [self setupDebugPage];
+        [self buildFuncPage];
+        [self buildDebugPage];
     }
     return self;
 }
 
-// 构建功能页
-- (void)setupFuncPage {
+- (void)buildFuncPage {
     UILabel *procLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, self.funcPageView.frame.size.width - 24, 24)];
     procLabel.text = @"选择进程: 声控物语 (活跃)";
     procLabel.textColor = [UIColor whiteColor];
@@ -264,11 +274,10 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
     }
 }
 
-// 构建调试页（滑块微调）
-- (void)setupDebugPage {
-    NSArray *debugItems = @[@"音量增益", @"低频打击", @"高频清晰", @"双音强度"];
+- (void)buildDebugPage {
+    NSArray *debugItems = @[@"音量增益", @"低频打击", @"高频清晰"];
     for (int i = 0; i < debugItems.count; i++) {
-        CGFloat y = 10 + i * 50;
+        CGFloat y = 15 + i * 55;
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 160, 18)];
         lbl.text = debugItems[i];
         lbl.textColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
@@ -277,20 +286,19 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
 
         UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(12, y + 20, self.debugPageView.frame.size.width - 24, 20)];
         slider.tag = 300 + i;
-        if (i == 0) { slider.minimumValue = 100; slider.maximumValue = 800; slider.value = kDebugGain; }
-        if (i == 1) { slider.minimumValue = 0; slider.maximumValue = 20; slider.value = kDebugBassGain; }
-        if (i == 2) { slider.minimumValue = 0; slider.maximumValue = 20; slider.value = kDebugClarityGain; }
-        if (i == 3) { slider.minimumValue = 0; slider.maximumValue = 100; slider.value = kDebugEchoGain; }
+        if (i == 0) { slider.minimumValue = 100; slider.maximumValue = 600; slider.value = kDebugGain; }
+        if (i == 1) { slider.minimumValue = 0; slider.maximumValue = 15; slider.value = kDebugBassGain; }
+        if (i == 2) { slider.minimumValue = 0; slider.maximumValue = 15; slider.value = kDebugClarityGain; }
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
     }
 }
 
 - (void)tabClicked:(UIButton *)btn {
-    if (btn.tag == 200) { // 功能
+    if (btn.tag == 200) {
         self.funcPageView.hidden = NO;
         self.debugPageView.hidden = YES;
-    } else if (btn.tag == 201) { // 调试
+    } else if (btn.tag == 201) {
         self.funcPageView.hidden = YES;
         self.debugPageView.hidden = NO;
     }
@@ -300,7 +308,6 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
     if (slider.tag == 300) kDebugGain = slider.value;
     if (slider.tag == 301) kDebugBassGain = slider.value;
     if (slider.tag == 302) kDebugClarityGain = slider.value;
-    if (slider.tag == 303) kDebugEchoGain = slider.value;
     SyncGlobalAudioMatrix(g_activeZegoApi);
 }
 
@@ -330,30 +337,31 @@ static void SyncGlobalAudioMatrix(id zegoApi) {
 
 @end
 
-// ---------------------- 注入启动与手势唤醒 ----------------------
-static BattleMasterHUD *g_hudView = nil;
-static NSTimeInterval g_lastTap = 0;
+// ---------------------- 全局手势唤醒 ----------------------
+static SafeHUDView *g_hudInstance = nil;
+static NSTimeInterval g_lastTapStamp = 0;
 
-@interface HUDGestureProxy : NSObject <UIGestureRecognizerDelegate>
+@interface SafeGestureManager : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
-- (void)registerOnWindow:(UIWindow *)window;
+- (void)attachToWindow:(UIWindow *)window;
 @end
 
-@implementation HUDGestureProxy
+@implementation SafeGestureManager
 + (instancetype)shared {
-    static HUDGestureProxy *p;
+    static SafeGestureManager *m;
     static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ p = [[HUDGestureProxy alloc] init]; });
-    return p;
+    dispatch_once(&onceToken, ^{ m = [[SafeGestureManager alloc] init]; });
+    return m;
 }
-- (void)registerOnWindow:(UIWindow *)window {
+- (void)attachToWindow:(UIWindow *)window {
     if (!window) return;
+    // 避免重复添加手势
     for (UIGestureRecognizer *g in window.gestureRecognizers) {
         if ([g isKindOfClass:[UITapGestureRecognizer class]] && ((UITapGestureRecognizer *)g).numberOfTouchesRequired == 2) {
             return;
         }
     }
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTwoFingerDoubleTap:)];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTap:)];
     tap.numberOfTouchesRequired = 2;
     tap.numberOfTapsRequired = 2;
     tap.cancelsTouchesInView = NO;
@@ -363,13 +371,13 @@ static NSTimeInterval g_lastTap = 0;
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g1 shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)g2 {
     return YES;
 }
-- (void)onTwoFingerDoubleTap:(UITapGestureRecognizer *)tap {
+- (void)handleTap:(UITapGestureRecognizer *)tap {
     if (tap.state != UIGestureRecognizerStateEnded) return;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - g_lastTap < 0.45) return;
-    g_lastTap = now;
+    if (now - g_lastTapStamp < 0.45) return;
+    g_lastTapStamp = now;
 
-    // 兼容 iOS 13+ 获取 keyWindow 的方式
+    // 兼容 iOS 13+ 获取 keyWindow
     UIWindow *targetWindow = nil;
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -389,18 +397,18 @@ static NSTimeInterval g_lastTap = 0;
         targetWindow = [UIApplication sharedApplication].windows.firstObject;
     }
 
-    if (!g_hudView) {
-        g_hudView = [[BattleMasterHUD alloc] initWithFrame:CGRectMake(25, 120, 275, 225)];
-        [targetWindow addSubview:g_hudView];
+    if (!g_hudInstance) {
+        g_hudInstance = [[SafeHUDView alloc] initWithFrame:CGRectMake(25, 120, 275, 225)];
+        [targetWindow addSubview:g_hudInstance];
         return;
     }
-    if (g_hudView.hidden || g_hudView.alpha < 0.1f) {
-        if (g_hudView.superview != targetWindow) [targetWindow addSubview:g_hudView];
-        [targetWindow bringSubviewToFront:g_hudView];
-        g_hudView.hidden = NO;
-        [UIView animateWithDuration:0.2 animations:^{ g_hudView.alpha = 1.0f; }];
+    if (g_hudInstance.hidden || g_hudInstance.alpha < 0.1f) {
+        if (g_hudInstance.superview != targetWindow) [targetWindow addSubview:g_hudInstance];
+        [targetWindow bringSubviewToFront:g_hudInstance];
+        g_hudInstance.hidden = NO;
+        [UIView animateWithDuration:0.2 animations:^{ g_hudInstance.alpha = 1.0f; }];
     } else {
-        [UIView animateWithDuration:0.2 animations:^{ g_hudView.alpha = 0.0f; } completion:^(BOOL f) { g_hudView.hidden = YES; }];
+        [UIView animateWithDuration:0.2 animations:^{ g_hudInstance.alpha = 0.0f; } completion:^(BOOL f) { g_hudInstance.hidden = YES; }];
     }
 }
 @end
@@ -408,6 +416,6 @@ static NSTimeInterval g_lastTap = 0;
 %hook UIWindow
 - (void)makeKeyAndVisible {
     %orig;
-    [[HUDGestureProxy shared] registerOnWindow:self];
+    [[SafeGestureManager shared] attachToWindow:self];
 }
 %end

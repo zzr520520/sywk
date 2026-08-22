@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 1.2.0
+Version: 1.2.1
 Architecture: iphoneos-arm64
-Description: 声控物语多功能搏击战斗音效与实时调参插件
+Description: 声控物语多功能搏击战斗音效与实时调参插件（稳定版）
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks
