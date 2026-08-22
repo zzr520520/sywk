@@ -1,0 +1,8 @@
+Package: com.hwc.fightvoicepro
+Name: 声控物语搏击音效
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 专用于声控物语的麦克风采集放大与搏击清晰音效插件
+Maintainer: CustomDev
+Author: CustomDev
+Section: Tweaks

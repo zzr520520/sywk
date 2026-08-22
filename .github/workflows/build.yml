@@ -1,0 +1,40 @@
+name: Build Tweak (.deb & .dylib)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Theos and SDKs
+        run: |
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          echo "THEOS=~/theos" >> $GITHUB_ENV
+          
+          # 下载官方 iOS SDK
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mkdir -p ~/theos/sdks
+          cp -r sdks-master/*.sdk ~/theos/sdks/ || true
+          rm -rf sdks-master master.zip
+
+      - name: Compile Package
+        run: |
+          export THEOS=~/theos
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Upload Output Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FightVoicePro-Package
+          path: |
+            packages/*.deb
+            .theos/obj/debug/*.dylib
+            .theos/obj/*.dylib
