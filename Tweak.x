@@ -1,8 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
-#import <AVFoundation/AVFoundation.h>
 
-// ---------------------- 模式枚举与全局变量 ----------------------
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
     FightMode_New,      // 新清晰搏击
@@ -14,21 +12,22 @@ static BOOL kForceOpenMic = NO;
 static BOOL kSmartNoiseFilter = NO;
 static FightAudioMode kCurrentFightMode = FightMode_New;
 
-// 独立分档增益调节 (调试页独立调节)
+// 独立增益
 static float kNewFightGain = 500.0f;
 static float kOldFightGain = 1000.0f;
 static float kSuperFightGain = 1500.0f;
-static float kVoiceGainRatio = 1.0f;       // 人声权重
-static float kEffectVolumePercent = 65.0f; // 效果音量百分比 (永远比人声低)
+static float kVoiceGainRatio = 1.0f;
+static float kEffectVolumePercent = 50.0f; // 效果音音量
 
-static NSString *kSelectedEffectFileName = nil; // 当前选中的效果音文件名
+static NSString *kCurrentEffectFile = nil; // 当前选中的底噪文件
+static NSString *kCurrentMusicFile = nil;  // 当前推流的音乐文件
 
 static __weak id g_activeZegoApi = nil;
-static id g_zegoMusicPlayer = nil;
-static id g_zegoEffectPlayer = nil;
+static id g_musicPlayer = nil;
+static id g_effectPlayer = nil;
 static dispatch_source_t g_keepAliveTimer = nil;
 
-@interface NSObject (ZegoComprehensiveDeclarations)
+@interface NSObject (ZegoAudioCoreAPIs)
 - (bool)setCaptureVolume:(int)volume;
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
@@ -37,25 +36,23 @@ static dispatch_source_t g_keepAliveTimer = nil;
 - (bool)enableAEC:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
 - (bool)enableMic:(bool)enable;
-- (bool)setPlayVolume:(int)volume;
-
-// 播放器专用
+// 播放器推流核心
 - (void)setAudioStreamType:(int)type;
 - (void)setProcessType:(int)type;
 - (bool)start:(NSString *)path;
 - (void)setPublishVolume:(int)volume;
 - (void)setPlayoutVolume:(int)volume;
-- (void)enableAux:(bool)enable;
+- (void)setLoopCount:(int)count;
 @end
 
-// ---------------------- 辅助路径函数 ----------------------
-static NSString *GetBaseDir(NSString *sub) {
+// ---------------------- 路径辅助 ----------------------
+static NSString *GetSafeDir(NSString *subDir) {
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *path = [doc stringByAppendingPathComponent:sub];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *dir = [doc stringByAppendingPathComponent:subDir];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    return path;
+    return dir;
 }
 
 // ---------------------- 兼容 iOS 13+ 获取 keyWindow ----------------------
@@ -91,7 +88,52 @@ static void SafeStopPlayer(id player) {
     } @catch (NSException *e) {}
 }
 
-// ---------------------- 核心调音与效果音伴随矩阵 ----------------------
+// ---------------------- 纯 SDK 推流通道播放引擎 ----------------------
+static void PlayTrackToRemoteStream(NSString *filePath, BOOL isMusic) {
+    if (!filePath || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) return;
+
+    Class zPlayerClass = NSClassFromString(@"ZegoMediaPlayer");
+    if (!zPlayerClass) return;
+
+    id *targetPlayer = isMusic ? &g_musicPlayer : &g_effectPlayer;
+    if (!(*targetPlayer)) {
+        *targetPlayer = [[zPlayerClass alloc] init];
+    }
+
+    id player = *targetPlayer;
+    @try {
+        SafeStopPlayer(player);
+        // 核心配置：设置音频流类型为推流输出（2 = PublishStream + Playout）
+        if ([player respondsToSelector:@selector(setAudioStreamType:)]) {
+            [player setAudioStreamType:2];
+        }
+        // 核心配置：设置处理类型为 0 (混入推流通道)
+        if ([player respondsToSelector:@selector(setProcessType:)]) {
+            [player setProcessType:0];
+        }
+        if ([player respondsToSelector:@selector(setLoopCount:)]) {
+            [player setLoopCount:-1]; // 循环推流
+        }
+        
+        int pushVol = isMusic ? 100 : (int)kEffectVolumePercent;
+        if ([player respondsToSelector:@selector(setPublishVolume:)]) {
+            [player setPublishVolume:pushVol]; // 推向远端房间
+        }
+        if ([player respondsToSelector:@selector(setPlayoutVolume:)]) {
+            [player setPlayoutVolume:pushVol];  // 本地耳机监听
+        }
+        if ([player respondsToSelector:@selector(start:)]) {
+            [player start:filePath];
+        }
+    } @catch (NSException *e) {}
+}
+
+static void StopStreamPlayer(BOOL isMusic) {
+    id player = isMusic ? g_musicPlayer : g_effectPlayer;
+    SafeStopPlayer(player);
+}
+
+// ---------------------- 调音矩阵（去除低频海浪轰鸣，保留纯正电台撕拉感） ----------------------
 static void ApplyPreciseRadioFightDSP(id zegoApi) {
     if (!zegoApi) return;
 
@@ -113,10 +155,11 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
         if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
             for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
         }
+        StopStreamPlayer(NO);
         return;
     }
 
-    // 关停限幅与3A
+    // 关闭限幅保护
     if (!kSmartNoiseFilter) {
         if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
         if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
@@ -124,92 +167,53 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
     if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
     if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
 
-    // 1. 获取对应模式的独立增益，并叠加人声权重
+    // 音量计算
     float baseGain = kNewFightGain;
     if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
     if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-    int finalVoiceVolume = (int)(baseGain * kVoiceGainRatio);
+    int finalVolume = (int)(baseGain * kVoiceGainRatio);
 
     if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) {
-        [zegoApi setCaptureVolume:finalVoiceVolume];
+        [zegoApi setCaptureVolume:finalVolume];
     }
 
-    // 2. 效果音音量自动压低（永远比人声低）
-    int effectVol = (int)(kEffectVolumePercent * 0.8f);
-    if (g_zegoEffectPlayer && [g_zegoEffectPlayer respondsToSelector:@selector(setPublishVolume:)]) {
-        [g_zegoEffectPlayer setPublishVolume:effectVol];
-    }
-
-    // 3. EQ 塑造（电台撕拉感 + 人声极度清晰）
+    // 严密修复海浪声：切除 0(31Hz) 和 1(62Hz)，突出 1k~4kHz 撕拉清晰感
     @try {
         if (kCurrentFightMode == FightMode_New) {
-            [zegoApi setAudioEqualizerGain:-6.0f index:0];
-            [zegoApi setAudioEqualizerGain:4.0f index:2];
-            [zegoApi setAudioEqualizerGain:-10.0f index:4]; // 削减500Hz混浊
+            [zegoApi setAudioEqualizerGain:-12.0f index:0]; // 切除超低频海浪声
+            [zegoApi setAudioEqualizerGain:-6.0f index:1];
+            [zegoApi setAudioEqualizerGain:2.0f index:2];   // 125Hz 适度饱满
+            [zegoApi setAudioEqualizerGain:-10.0f index:4]; // 500Hz 削减空腔音
             [zegoApi setAudioEqualizerGain:12.0f index:5];  // 1kHz
             [zegoApi setAudioEqualizerGain:16.0f index:6];  // 2kHz
-            [zegoApi setAudioEqualizerGain:18.0f index:7];  // 4kHz 齿音穿透
-            [zegoApi setAudioEqualizerGain:14.0f index:8];
-            [zegoApi setAudioEqualizerGain:10.0f index:9];
+            [zegoApi setAudioEqualizerGain:18.0f index:7];  // 4kHz 极度清晰
+            [zegoApi setAudioEqualizerGain:12.0f index:8];  // 8kHz
+            [zegoApi setAudioEqualizerGain:8.0f index:9];
         } else if (kCurrentFightMode == FightMode_Old) {
-            [zegoApi setAudioEqualizerGain:12.0f index:1];
-            [zegoApi setAudioEqualizerGain:14.0f index:2];
+            [zegoApi setAudioEqualizerGain:-10.0f index:0];
+            [zegoApi setAudioEqualizerGain:2.0f index:1];
+            [zegoApi setAudioEqualizerGain:8.0f index:2];
             [zegoApi setAudioEqualizerGain:-4.0f index:4];
-            [zegoApi setAudioEqualizerGain:18.0f index:5];
-            [zegoApi setAudioEqualizerGain:22.0f index:6];
-            [zegoApi setAudioEqualizerGain:22.0f index:7];
-            [zegoApi setAudioEqualizerGain:18.0f index:8];
-            [zegoApi setAudioEqualizerGain:14.0f index:9];
+            [zegoApi setAudioEqualizerGain:16.0f index:5];
+            [zegoApi setAudioEqualizerGain:20.0f index:6];  // 强力过载撕拉
+            [zegoApi setAudioEqualizerGain:20.0f index:7];
+            [zegoApi setAudioEqualizerGain:14.0f index:8];
         } else if (kCurrentFightMode == FightMode_Super) {
-            for (int i = 0; i < 10; i++) {
-                [zegoApi setAudioEqualizerGain:24.0f index:i];
+            [zegoApi setAudioEqualizerGain:-8.0f index:0]; // 依然切除31Hz防海浪
+            for (int i = 1; i < 10; i++) {
+                [zegoApi setAudioEqualizerGain:22.0f index:i];
             }
         }
     } @catch (NSException *e) {}
-}
 
-// ---------------------- 效果音伴随推流触发器 ----------------------
-static void TriggerEffectAudioPush(BOOL start) {
-    if (!kSelectedEffectFileName) return;
-    NSString *fullPath = [GetBaseDir(@"FightEffects") stringByAppendingPathComponent:kSelectedEffectFileName];
-
-    if (![[NSFileManager defaultManager] fileExistsAtPath:fullPath]) return;
-
-    if (!g_zegoEffectPlayer) {
-        Class zegoPlayerCls = NSClassFromString(@"ZegoMediaPlayer");
-        if (zegoPlayerCls) g_zegoEffectPlayer = [[zegoPlayerCls alloc] init];
-    }
-
-    if (g_zegoEffectPlayer) {
-        @try {
-            if (start) {
-                SafeStopPlayer(g_zegoEffectPlayer);
-                // 2 = 混入推流通道 + 本地耳机
-                if ([g_zegoEffectPlayer respondsToSelector:@selector(setAudioStreamType:)]) {
-                    [g_zegoEffectPlayer setAudioStreamType:2];
-                }
-                if ([g_zegoEffectPlayer respondsToSelector:@selector(setProcessType:)]) {
-                    [g_zegoEffectPlayer setProcessType:0];
-                }
-                int effectVol = (int)(kEffectVolumePercent * 0.8f);
-                if ([g_zegoEffectPlayer respondsToSelector:@selector(setPublishVolume:)]) {
-                    [g_zegoEffectPlayer setPublishVolume:effectVol];
-                }
-                if ([g_zegoEffectPlayer respondsToSelector:@selector(setPlayoutVolume:)]) {
-                    [g_zegoEffectPlayer setPlayoutVolume:effectVol];
-                }
-                if ([g_zegoEffectPlayer respondsToSelector:@selector(start:)]) {
-                    [g_zegoEffectPlayer start:fullPath];
-                }
-            } else {
-                SafeStopPlayer(g_zegoEffectPlayer);
-            }
-        } @catch (NSException *e) {}
+    // 更新伴随效果音音量
+    if (g_effectPlayer && [g_effectPlayer respondsToSelector:@selector(setPublishVolume:)]) {
+        [g_effectPlayer setPublishVolume:(int)kEffectVolumePercent];
     }
 }
 
 // ---------------------- 保活线程 ----------------------
-static void StartKeepAliveService() {
+static void StartAudioKeepAliveService() {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
@@ -226,25 +230,14 @@ static void StartKeepAliveService() {
     });
 }
 
-// ---------------------- Hook 底层与业务 ----------------------
+// ---------------------- Hook ----------------------
 %hook ZegoLiveRoomApi
 
 - (id)init {
     id inst = %orig;
     g_activeZegoApi = inst;
-    StartKeepAliveService();
+    StartAudioKeepAliveService();
     return inst;
-}
-
-- (bool)setCaptureVolume:(int)volume {
-    g_activeZegoApi = self;
-    if (kCurrentFightMode != FightMode_Normal) {
-        float baseGain = kNewFightGain;
-        if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
-        if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-        return %orig((int)(baseGain * kVoiceGainRatio));
-    }
-    return %orig(volume);
 }
 
 - (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo {
@@ -252,7 +245,9 @@ static void StartKeepAliveService() {
     bool res = %orig;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyPreciseRadioFightDSP(self);
-        TriggerEffectAudioPush(YES);
+        if (kCurrentEffectFile && kCurrentFightMode != FightMode_Normal) {
+            PlayTrackToRemoteStream([GetSafeDir(@"FightEffects") stringByAppendingPathComponent:kCurrentEffectFile], NO);
+        }
     });
     return res;
 }
@@ -262,7 +257,9 @@ static void StartKeepAliveService() {
     bool res = %orig;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyPreciseRadioFightDSP(self);
-        TriggerEffectAudioPush(YES);
+        if (kCurrentEffectFile && kCurrentFightMode != FightMode_Normal) {
+            PlayTrackToRemoteStream([GetSafeDir(@"FightEffects") stringByAppendingPathComponent:kCurrentEffectFile], NO);
+        }
     });
     return res;
 }
@@ -272,13 +269,16 @@ static void StartKeepAliveService() {
     bool res = %orig;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyPreciseRadioFightDSP(self);
-        TriggerEffectAudioPush(YES);
+        if (kCurrentEffectFile && kCurrentFightMode != FightMode_Normal) {
+            PlayTrackToRemoteStream([GetSafeDir(@"FightEffects") stringByAppendingPathComponent:kCurrentEffectFile], NO);
+        }
     });
     return res;
 }
 
 - (bool)stopPublishing {
-    TriggerEffectAudioPush(NO);
+    StopStreamPlayer(NO);
+    StopStreamPlayer(YES);
     return %orig;
 }
 
@@ -294,22 +294,21 @@ static void StartKeepAliveService() {
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyPreciseRadioFightDSP(g_activeZegoApi);
-        if (enable || kForceOpenMic) {
-            TriggerEffectAudioPush(YES);
-        } else {
-            TriggerEffectAudioPush(NO);
+        if ((enable || kForceOpenMic) && kCurrentEffectFile && kCurrentFightMode != FightMode_Normal) {
+            PlayTrackToRemoteStream([GetSafeDir(@"FightEffects") stringByAppendingPathComponent:kCurrentEffectFile], NO);
+        } else if (!enable && !kForceOpenMic) {
+            StopStreamPlayer(NO);
         }
     });
 }
 
 %end
 
-// ---------------------- 音乐管理器 (双轨推流修复) ----------------------
+// ---------------------- 音乐管理视图 (纯 SDK 远端推流) ----------------------
 @interface MusicManagerView : UIView <UITableViewDelegate, UITableViewDataSource, UIDocumentPickerDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableArray<NSString *> *musicFiles;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) AVAudioPlayer *auxHardwarePlayer;
 @end
 
 @implementation MusicManagerView
@@ -361,9 +360,9 @@ static void StartKeepAliveService() {
 
 - (void)refreshFileList {
     [self.musicFiles removeAllObjects];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:GetBaseDir(@"FightMusic") error:nil];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:GetSafeDir(@"FightMusic") error:nil];
     for (NSString *f in files) {
-        if ([f.pathExtension.lowercaseString isEqualToString:@"mp3"] || [f.pathExtension.lowercaseString isEqualToString:@"m4a"] || [f.pathExtension.lowercaseString isEqualToString:@"wav"]) {
+        if ([f.pathExtension.lowercaseString isEqualToString:@"mp3"] || [f.pathExtension.lowercaseString isEqualToString:@"wav"] || [f.pathExtension.lowercaseString isEqualToString:@"m4a"]) {
             [self.musicFiles addObject:f];
         }
     }
@@ -383,7 +382,7 @@ static void StartKeepAliveService() {
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     for (NSURL *url in urls) {
-        NSString *dest = [GetBaseDir(@"FightMusic") stringByAppendingPathComponent:url.lastPathComponent];
+        NSString *dest = [GetSafeDir(@"FightMusic") stringByAppendingPathComponent:url.lastPathComponent];
         [[NSFileManager defaultManager] copyItemAtPath:url.path toPath:dest error:nil];
     }
     [self refreshFileList];
@@ -440,75 +439,41 @@ static void StartKeepAliveService() {
     sendBtn.tag = indexPath.row;
     delBtn.tag = indexPath.row;
 
-    [sendBtn addTarget:self action:@selector(playAndPublishTrack:) forControlEvents:UIControlEventTouchUpInside];
-    [delBtn addTarget:self action:@selector(deleteMusicFile:) forControlEvents:UIControlEventTouchUpInside];
+    [sendBtn addTarget:self action:@selector(publishTrack:) forControlEvents:UIControlEventTouchUpInside];
+    [delBtn addTarget:self action:@selector(deleteFile:) forControlEvents:UIControlEventTouchUpInside];
 
     return cell;
 }
 
-- (void)deleteMusicFile:(UIButton *)btn {
+- (void)deleteFile:(UIButton *)btn {
     if (btn.tag >= (NSInteger)self.musicFiles.count) return;
     NSString *fileName = self.musicFiles[btn.tag];
-    NSString *filePath = [GetBaseDir(@"FightMusic") stringByAppendingPathComponent:fileName];
-    [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:[GetSafeDir(@"FightMusic") stringByAppendingPathComponent:fileName] error:nil];
+    if ([kCurrentMusicFile isEqualToString:fileName]) {
+        StopStreamPlayer(YES);
+        kCurrentMusicFile = nil;
+    }
     [self.musicFiles removeObjectAtIndex:btn.tag];
     [self.tableView reloadData];
 }
 
-// 双轨推流：SDK 推流通道 + 硬件层强制混流保障
-- (void)playAndPublishTrack:(UIButton *)btn {
+- (void)publishTrack:(UIButton *)btn {
     if (btn.tag >= (NSInteger)self.musicFiles.count) return;
-    NSString *fileName = self.musicFiles[btn.tag];
-    NSString *fullPath = [GetBaseDir(@"FightMusic") stringByAppendingPathComponent:fileName];
-    self.statusLabel.text = [NSString stringWithFormat:@"推流中: %@", fileName];
-
-    // 1. Zego 推流通道注入
-    if (!g_zegoMusicPlayer) {
-        Class zegoPlayerCls = NSClassFromString(@"ZegoMediaPlayer");
-        if (zegoPlayerCls) g_zegoMusicPlayer = [[zegoPlayerCls alloc] init];
-    }
-    if (g_zegoMusicPlayer) {
-        @try {
-            SafeStopPlayer(g_zegoMusicPlayer);
-            if ([g_zegoMusicPlayer respondsToSelector:@selector(setAudioStreamType:)]) {
-                [g_zegoMusicPlayer setAudioStreamType:2];
-            }
-            if ([g_zegoMusicPlayer respondsToSelector:@selector(setPublishVolume:)]) {
-                [g_zegoMusicPlayer setPublishVolume:100];
-            }
-            if ([g_zegoMusicPlayer respondsToSelector:@selector(setPlayoutVolume:)]) {
-                [g_zegoMusicPlayer setPlayoutVolume:100];
-            }
-            if ([g_zegoMusicPlayer respondsToSelector:@selector(start:)]) {
-                [g_zegoMusicPlayer start:fullPath];
-            }
-        } @catch (NSException *e) {}
-    }
-
-    // 2. 硬件层强制混流保障（确保麦克风必带音乐）
-    NSError *err = nil;
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionDefaultToSpeaker error:nil];
-    [session setActive:YES error:nil];
-
-    self.auxHardwarePlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:fullPath] error:&err];
-    self.auxHardwarePlayer.numberOfLoops = -1;
-    self.auxHardwarePlayer.volume = 1.0f;
-    [self.auxHardwarePlayer prepareToPlay];
-    [self.auxHardwarePlayer play];
+    kCurrentMusicFile = self.musicFiles[btn.tag];
+    NSString *fullPath = [GetSafeDir(@"FightMusic") stringByAppendingPathComponent:kCurrentMusicFile];
+    self.statusLabel.text = [NSString stringWithFormat:@"远端推流中: %@", kCurrentMusicFile];
+    PlayTrackToRemoteStream(fullPath, YES);
 }
 
 - (void)stopPlayMusic {
-    SafeStopPlayer(g_zegoMusicPlayer);
-    if (self.auxHardwarePlayer && [self.auxHardwarePlayer isPlaying]) {
-        [self.auxHardwarePlayer stop];
-    }
-    self.statusLabel.text = @"已停止";
+    StopStreamPlayer(YES);
+    kCurrentMusicFile = nil;
+    self.statusLabel.text = @"已停止推流";
 }
 
 @end
 
-// ---------------------- 效果音管理器 (设置页内嵌) ----------------------
+// ---------------------- 设置页（多底噪自由选用管理） ----------------------
 @interface EffectManagerView : UIView <UITableViewDelegate, UITableViewDataSource, UIDocumentPickerDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableArray<NSString *> *effectFiles;
@@ -525,7 +490,7 @@ static void StartKeepAliveService() {
 
         UIButton *importBtn = [UIButton buttonWithType:UIButtonTypeCustom];
         importBtn.frame = CGRectMake(8, 6, 80, 24);
-        [importBtn setTitle:@"+ 导入效果音" forState:UIControlStateNormal];
+        [importBtn setTitle:@"+ 导入底噪" forState:UIControlStateNormal];
         [importBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         importBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
         importBtn.backgroundColor = [UIColor colorWithRed:0.3 green:0.5 blue:0.9 alpha:1.0];
@@ -534,7 +499,7 @@ static void StartKeepAliveService() {
         [self addSubview:importBtn];
 
         self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(96, 6, frame.size.width - 100, 24)];
-        self.statusLabel.text = kSelectedEffectFileName ? [NSString stringWithFormat:@"当前选用: %@", kSelectedEffectFileName] : @"未勾选效果音";
+        self.statusLabel.text = kCurrentEffectFile ? [NSString stringWithFormat:@"当前: %@", kCurrentEffectFile] : @"未启用底噪";
         self.statusLabel.font = [UIFont systemFontOfSize:10];
         self.statusLabel.textColor = [UIColor colorWithRed:0.4 green:0.8 blue:1.0 alpha:1.0];
         [self addSubview:self.statusLabel];
@@ -554,14 +519,11 @@ static void StartKeepAliveService() {
 
 - (void)refreshFileList {
     [self.effectFiles removeAllObjects];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:GetBaseDir(@"FightEffects") error:nil];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:GetSafeDir(@"FightEffects") error:nil];
     for (NSString *f in files) {
         if ([f.pathExtension.lowercaseString isEqualToString:@"mp3"] || [f.pathExtension.lowercaseString isEqualToString:@"wav"]) {
             [self.effectFiles addObject:f];
         }
-    }
-    if (!kSelectedEffectFileName && self.effectFiles.count > 0) {
-        kSelectedEffectFileName = self.effectFiles.firstObject;
     }
     [self.tableView reloadData];
 }
@@ -579,7 +541,7 @@ static void StartKeepAliveService() {
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     for (NSURL *url in urls) {
-        NSString *dest = [GetBaseDir(@"FightEffects") stringByAppendingPathComponent:url.lastPathComponent];
+        NSString *dest = [GetSafeDir(@"FightEffects") stringByAppendingPathComponent:url.lastPathComponent];
         [[NSFileManager defaultManager] copyItemAtPath:url.path toPath:dest error:nil];
     }
     [self refreshFileList];
@@ -590,9 +552,9 @@ static void StartKeepAliveService() {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"EffectItemCell"];
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"EffectCell"];
     if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"EffectItemCell"];
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"EffectCell"];
         cell.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
         cell.layer.cornerRadius = 6;
         cell.textLabel.textColor = [UIColor whiteColor];
@@ -602,10 +564,7 @@ static void StartKeepAliveService() {
 
         UIButton *useBtn = [UIButton buttonWithType:UIButtonTypeCustom];
         useBtn.frame = CGRectMake(0, 1, 48, 22);
-        [useBtn setTitle:@"选用" forState:UIControlStateNormal];
-        [useBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         useBtn.titleLabel.font = [UIFont boldSystemFontOfSize:10.5];
-        useBtn.backgroundColor = [UIColor colorWithRed:0.25 green:0.75 blue:0.35 alpha:1.0];
         useBtn.layer.cornerRadius = 4;
         useBtn.tag = 3000;
         [actionContainer addSubview:useBtn];
@@ -636,40 +595,55 @@ static void StartKeepAliveService() {
     useBtn.tag = indexPath.row;
     delBtn.tag = indexPath.row;
 
-    if ([fileName isEqualToString:kSelectedEffectFileName]) {
-        [useBtn setTitle:@"已选" forState:UIControlStateNormal];
-        useBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.5 blue:0.8 alpha:1.0];
+    if ([fileName isEqualToString:kCurrentEffectFile]) {
+        [useBtn setTitle:@"使用中" forState:UIControlStateNormal];
+        [useBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        useBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.5 blue:0.9 alpha:1.0];
     } else {
         [useBtn setTitle:@"选用" forState:UIControlStateNormal];
+        [useBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         useBtn.backgroundColor = [UIColor colorWithRed:0.25 green:0.75 blue:0.35 alpha:1.0];
     }
 
-    [useBtn addTarget:self action:@selector(selectEffectFile:) forControlEvents:UIControlEventTouchUpInside];
-    [delBtn addTarget:self action:@selector(deleteEffectFile:) forControlEvents:UIControlEventTouchUpInside];
+    [useBtn addTarget:self action:@selector(selectEffect:) forControlEvents:UIControlEventTouchUpInside];
+    [delBtn addTarget:self action:@selector(deleteEffect:) forControlEvents:UIControlEventTouchUpInside];
 
     return cell;
 }
 
-- (void)selectEffectFile:(UIButton *)btn {
+- (void)selectEffect:(UIButton *)btn {
     if (btn.tag >= (NSInteger)self.effectFiles.count) return;
-    kSelectedEffectFileName = self.effectFiles[btn.tag];
-    self.statusLabel.text = [NSString stringWithFormat:@"当前选用: %@", kSelectedEffectFileName];
+    NSString *picked = self.effectFiles[btn.tag];
+    if ([picked isEqualToString:kCurrentEffectFile]) {
+        kCurrentEffectFile = nil;
+        StopStreamPlayer(NO);
+        self.statusLabel.text = @"未启用底噪";
+    } else {
+        kCurrentEffectFile = picked;
+        self.statusLabel.text = [NSString stringWithFormat:@"当前: %@", kCurrentEffectFile];
+        if (kCurrentFightMode != FightMode_Normal) {
+            PlayTrackToRemoteStream([GetSafeDir(@"FightEffects") stringByAppendingPathComponent:kCurrentEffectFile], NO);
+        }
+    }
     [self.tableView reloadData];
 }
 
-- (void)deleteEffectFile:(UIButton *)btn {
+- (void)deleteEffect:(UIButton *)btn {
     if (btn.tag >= (NSInteger)self.effectFiles.count) return;
     NSString *fileName = self.effectFiles[btn.tag];
-    NSString *filePath = [GetBaseDir(@"FightEffects") stringByAppendingPathComponent:fileName];
-    [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
-    if ([kSelectedEffectFileName isEqualToString:fileName]) kSelectedEffectFileName = nil;
+    [[NSFileManager defaultManager] removeItemAtPath:[GetSafeDir(@"FightEffects") stringByAppendingPathComponent:fileName] error:nil];
+    if ([kCurrentEffectFile isEqualToString:fileName]) {
+        StopStreamPlayer(NO);
+        kCurrentEffectFile = nil;
+        self.statusLabel.text = @"未启用底噪";
+    }
     [self.effectFiles removeObjectAtIndex:btn.tag];
     [self.tableView reloadData];
 }
 
 @end
 
-// ---------------------- 完整主界面 UI ----------------------
+// ---------------------- 主 HUD 面板 ----------------------
 @interface BattleMasterHUD : UIView <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIView *funcPageView;
 @property (nonatomic, strong) UIScrollView *debugPageView;
@@ -715,7 +689,7 @@ static void StartKeepAliveService() {
             [leftTab addSubview:btn];
         }
 
-        // 2. 右侧页面容器
+        // 2. 右侧页面
         CGFloat rightW = frame.size.width - 75;
         self.funcPageView = [[UIView alloc] initWithFrame:CGRectMake(75, 0, rightW, frame.size.height)];
         self.funcPageView.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.94];
@@ -790,7 +764,7 @@ static void StartKeepAliveService() {
 }
 
 - (void)setupDebugPage {
-    NSArray *items = @[@"新清晰音量 (默认500)", @"旧清晰音量 (默认1000)", @"超级战斗音量 (默认1500)", @"人声音量权重", @"效果音音量 (永低于人声)"];
+    NSArray *items = @[@"新清晰音量 (默认500)", @"旧清晰音量 (默认1000)", @"超级战斗音量 (默认1500)", @"人声音量权重", @"效果音推流音量"];
     for (int i = 0; i < items.count; i++) {
         CGFloat y = 8 + i * 58;
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, self.debugPageView.frame.size.width - 24, 16)];
@@ -805,7 +779,7 @@ static void StartKeepAliveService() {
         if (i == 1) { slider.minimumValue = 500; slider.maximumValue = 2000; slider.value = kOldFightGain; }
         if (i == 2) { slider.minimumValue = 1000; slider.maximumValue = 3000; slider.value = kSuperFightGain; }
         if (i == 3) { slider.minimumValue = 0.5f; slider.maximumValue = 2.0f; slider.value = kVoiceGainRatio; }
-        if (i == 4) { slider.minimumValue = 10; slider.maximumValue = 85; slider.value = kEffectVolumePercent; }
+        if (i == 4) { slider.minimumValue = 10; slider.maximumValue = 100; slider.value = kEffectVolumePercent; }
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
     }
