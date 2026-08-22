@@ -95,12 +95,16 @@ static void PlayTrackToRemoteStream(NSString *filePath, BOOL isMusic) {
     Class zPlayerClass = NSClassFromString(@"ZegoMediaPlayer");
     if (!zPlayerClass) return;
 
-    id *targetPlayer = isMusic ? &g_musicPlayer : &g_effectPlayer;
-    if (!(*targetPlayer)) {
-        *targetPlayer = [[zPlayerClass alloc] init];
+    id player = nil;
+    if (isMusic) {
+        if (!g_musicPlayer) g_musicPlayer = [[zPlayerClass alloc] init];
+        player = g_musicPlayer;
+    } else {
+        if (!g_effectPlayer) g_effectPlayer = [[zPlayerClass alloc] init];
+        player = g_effectPlayer;
     }
 
-    id player = *targetPlayer;
+    if (!player) return;
     @try {
         SafeStopPlayer(player);
         // 核心配置：设置音频流类型为推流输出（2 = PublishStream + Playout）
