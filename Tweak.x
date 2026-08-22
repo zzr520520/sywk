@@ -36,7 +36,6 @@ static dispatch_source_t g_keepAliveTimer = nil;
 // MediaPlayer 相关
 - (id)createMediaPlayer;
 - (bool)start:(NSString *)path;
-- (bool)stop;
 - (void)setPublishVolume:(int)volume;
 - (void)setPlayoutVolume:(int)volume;
 @end
@@ -371,8 +370,13 @@ static void StartKeepAliveService() {
             g_zegoMediaPlayer = [[zegoPlayerCls alloc] init];
         }
         @try {
-            [g_zegoMediaPlayer stop];
-            [g_zegoMediaPlayer start:fullPath];
+            // 使用 performSelector 避免 stop 方法签名与系统类冲突
+            if ([g_zegoMediaPlayer respondsToSelector:@selector(stop)]) {
+                [g_zegoMediaPlayer performSelector:@selector(stop)];
+            }
+            if ([g_zegoMediaPlayer respondsToSelector:@selector(start:)]) {
+                [g_zegoMediaPlayer start:fullPath];
+            }
             if ([g_zegoMediaPlayer respondsToSelector:@selector(setPublishVolume:)]) {
                 [g_zegoMediaPlayer setPublishVolume:100]; // 混入推流麦克风
             }
@@ -394,7 +398,11 @@ static void StartKeepAliveService() {
 
 - (void)stopPlayMusic {
     if (g_zegoMediaPlayer) {
-        @try { [g_zegoMediaPlayer stop]; } @catch (NSException *e) {}
+        @try {
+            if ([g_zegoMediaPlayer respondsToSelector:@selector(stop)]) {
+                [g_zegoMediaPlayer performSelector:@selector(stop)];
+            }
+        } @catch (NSException *e) {}
     }
     if (self.audioPlayer && [self.audioPlayer isPlaying]) {
         [self.audioPlayer stop];
