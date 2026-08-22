@@ -12,10 +12,15 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Install Theos Dependencies
+        run: |
+          brew install ldid xz
+
       - name: Install Theos and SDKs
         run: |
           git clone --recursive https://github.com/theos/theos.git ~/theos
-          echo "THEOS=~/theos" >> $GITHUB_ENV
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
           
           # 下载官方 iOS SDK
           curl -LO https://github.com/theos/sdks/archive/master.zip
@@ -23,10 +28,12 @@ jobs:
           mkdir -p ~/theos/sdks
           cp -r sdks-master/*.sdk ~/theos/sdks/ || true
           rm -rf sdks-master master.zip
+          
+          # 列出 SDK 确认安装
+          ls -la ~/theos/sdks/
 
       - name: Compile Package
         run: |
-          export THEOS=~/theos
           make clean
           make package FINALPACKAGE=1
 
