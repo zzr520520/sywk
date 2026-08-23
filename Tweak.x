@@ -4,59 +4,57 @@
 
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
-    FightMode_New,      // 新清晰 (800 增益 + 高穿透咬字)
-    FightMode_Old,      // 旧清晰 (1500 增益 + 饱满洪亮)
-    FightMode_Super     // 超级清晰 (2500 极限增益 + 极致清晰洪亮)
+    FightMode_New,      // 新清晰 (400 增益 + 齿音穿透)
+    FightMode_Old,      // 旧清晰 (600 增益 + 饱满洪亮)
+    FightMode_Super     // 超级清晰 (1000 封顶增益 + 极致清晰洪亮)
 } FightAudioMode;
 
 static BOOL kForceOpenMic = YES;      // 强制开麦
 static BOOL kOffSeatSpeak = NO;       // 台下直接开麦
-static BOOL kSmartNoiseFilter = NO;
 static FightAudioMode kCurrentFightMode = FightMode_New;
 
-// 极限增益控制
-static float kNewFightGain = 800.0f;
-static float kOldFightGain = 1500.0f;
-static float kSuperFightGain = 2500.0f;
+static float kNewFightGain = 400.0f;
+static float kOldFightGain = 600.0f;
+static float kSuperFightGain = 1000.0f;
 static float kVoiceGainRatio = 1.0f;
 
-static __weak id g_activeZegoApi = nil;
+static __weak id g_activeZegoEngine = nil;
+static __weak id g_activeZegoManager = nil;
 static dispatch_source_t g_keepAliveTimer = nil;
 
 // ---------------------- 前置函数声明 ----------------------
-static void ApplyPreciseRadioFightDSP(id zegoApi);
+static void ApplyCrystalLoudVoiceDSP(id zegoApi);
 static void StartKeepAliveService(void);
 static UIWindow *GetKeyWindow(void);
 static void TriggerOffSeatSpeak(BOOL enable);
 
-@interface NSObject (ZegoEnhancedSDKDeclarations)
-- (bool)setCaptureVolume:(int)volume;
+// ---------------------- 接口声明 (严格对齐逆向报告) ----------------------
+@interface ZegoAudioRoomApi : NSObject
+- (BOOL)startPublish;
+- (BOOL)startPublishWithStreamID:(NSString *)streamID;
+- (void)stopPublish;
+- (BOOL)enableMic:(BOOL)enable;
+- (void)setCaptureVolume:(int)volume;
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
-- (bool)setNoiseSuppressMode:(int)mode;
-- (bool)enableTransientNoiseSuppress:(bool)enable;
 - (bool)enableAEC:(bool)enable;
-- (bool)enableMic:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
-- (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag;
-- (bool)stopPublishing;
-@end
-
-// 业务层类声明
-@interface SKVoiceRoomManager : NSObject
-+ (instancetype)shareInstance;
-+ (instancetype)defaultManager;
-- (void)takeSeat:(NSInteger)seatIndex;
-- (void)reqUserMicroSeat:(NSInteger)index;
-- (void)joinMic;
 @end
 
 @interface SKAudioZegoManager : NSObject
 + (instancetype)sharedManager;
-// 注意: enableMic: 不在此声明，因 NSObject(ZegoEnhancedSDKDeclarations) 已声明 - (bool)enableMic:(bool)enable
-// 此处重复声明会导致方法签名冲突编译错误
-- (void)startPublish;
-- (void)stopPublish;
+@property (nonatomic, strong) ZegoAudioRoomApi *zegoEngine;
+@property (nonatomic, copy) NSString *roomId;
+@property (nonatomic, copy) NSString *userId;
+- (void)startPublishing;
+- (void)stopPublishing;
+- (void)muteMic:(BOOL)mute;
+- (void)setupENgine;
+@end
+
+@interface SKAudioManager : NSObject
+@property (nonatomic, strong) SKAudioZegoManager *manager;
+- (void)muteMic:(BOOL)mute;
 @end
 
 // ---------------------- 兼容 iOS 13+ 获取 keyWindow ----------------------
@@ -82,8 +80,8 @@ static UIWindow *GetKeyWindow() {
     return keyWindow;
 }
 
-// ---------------------- 极限大音量 + 高度清晰咬字调音矩阵 (无任何背景音) ----------------------
-static void ApplyPreciseRadioFightDSP(id zegoApi) {
+// ---------------------- 纯净清晰洪亮调音矩阵 (无任何杂音，封顶大音量) ----------------------
+static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if (!zegoApi) return;
 
     // 1. 强制保持麦克风开启
@@ -103,13 +101,12 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
         return;
     }
 
-    // 3. 彻底关闭 3A，释放硬件全部动态
+    // 3. 彻底关停 3A 压制，释放无损硬件动态
     if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
     if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
-    if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
     if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
 
-    // 4. 麦克风硬件推流增益拉满 (800 / 1500 / 2500)
+    // 4. 封顶纯净音量增益 (400 / 600 / 1000)
     float baseGain = kNewFightGain;
     if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
     if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
@@ -119,194 +116,174 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
         [zegoApi setCaptureVolume:finalVolume];
     }
 
-    // 5. 纯人声清晰度极致雕刻（削弱低频闷音，拉满 1k~4kHz 穿透频段）
+    // 5. 极致清晰度 EQ (削减发闷区，增强中气与齿音穿透)
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
         if (kCurrentFightMode == FightMode_New) {
             // 【新清晰】：人声极致清晰、齿音透亮
             [zegoApi setAudioEqualizerGain:-12.0f index:0]; // 31Hz 切除超低频防闷
-            [zegoApi setAudioEqualizerGain:-8.0f index:1];  // 62Hz 切除低频浑浊
-            [zegoApi setAudioEqualizerGain:0.0f index:2];   // 125Hz 保留基础声线
-            [zegoApi setAudioEqualizerGain:-6.0f index:3];  // 250Hz 消除鼻音发闷
-            [zegoApi setAudioEqualizerGain:-10.0f index:4]; // 500Hz 消除空腔浑浊
-            [zegoApi setAudioEqualizerGain:16.0f index:5];  // 1kHz 人声洪亮穿透
-            [zegoApi setAudioEqualizerGain:22.0f index:6];  // 2kHz 人声咬字清晰度
-            [zegoApi setAudioEqualizerGain:24.0f index:7];  // 4kHz 齿音极度清晰
-            [zegoApi setAudioEqualizerGain:16.0f index:8];  // 8kHz 亮感
-            [zegoApi setAudioEqualizerGain:10.0f index:9];  // 16kHz
+            [zegoApi setAudioEqualizerGain:-8.0f  index:1]; // 62Hz 切除浑浊
+            [zegoApi setAudioEqualizerGain:0.0f   index:2]; // 125Hz 适度基音
+            [zegoApi setAudioEqualizerGain:-8.0f  index:3]; // 250Hz 消除发闷
+            [zegoApi setAudioEqualizerGain:-10.0f index:4]; // 500Hz 消除空腔音
+            [zegoApi setAudioEqualizerGain:16.0f  index:5]; // 1kHz 人声中气穿透
+            [zegoApi setAudioEqualizerGain:22.0f  index:6]; // 2kHz 咬字清晰
+            [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz 齿音极度清晰
+            [zegoApi setAudioEqualizerGain:16.0f  index:8]; // 8kHz 亮感
+            [zegoApi setAudioEqualizerGain:10.0f  index:9]; // 16kHz
         } else if (kCurrentFightMode == FightMode_Old) {
-            // 【旧清晰】：饱满洪亮 + 极高清晰
-            [zegoApi setAudioEqualizerGain:-8.0f index:0];
-            [zegoApi setAudioEqualizerGain:-4.0f index:1];
-            [zegoApi setAudioEqualizerGain:4.0f index:2];
-            [zegoApi setAudioEqualizerGain:-4.0f index:3];
-            [zegoApi setAudioEqualizerGain:-6.0f index:4];
-            [zegoApi setAudioEqualizerGain:18.0f index:5];
-            [zegoApi setAudioEqualizerGain:24.0f index:6];
-            [zegoApi setAudioEqualizerGain:24.0f index:7];
-            [zegoApi setAudioEqualizerGain:18.0f index:8];
-            [zegoApi setAudioEqualizerGain:12.0f index:9];
+            // 【旧清晰】：饱满洪亮
+            [zegoApi setAudioEqualizerGain:-8.0f  index:0];
+            [zegoApi setAudioEqualizerGain:-4.0f  index:1];
+            [zegoApi setAudioEqualizerGain:4.0f   index:2];
+            [zegoApi setAudioEqualizerGain:-4.0f  index:3];
+            [zegoApi setAudioEqualizerGain:-6.0f  index:4];
+            [zegoApi setAudioEqualizerGain:18.0f  index:5];
+            [zegoApi setAudioEqualizerGain:24.0f  index:6];
+            [zegoApi setAudioEqualizerGain:24.0f  index:7];
+            [zegoApi setAudioEqualizerGain:18.0f  index:8];
+            [zegoApi setAudioEqualizerGain:12.0f  index:9];
         } else if (kCurrentFightMode == FightMode_Super) {
-            // 【超级清晰】：全频段最大功率输出 + 清晰咬字锁定
-            [zegoApi setAudioEqualizerGain:0.0f index:0];
-            [zegoApi setAudioEqualizerGain:4.0f index:1];
-            [zegoApi setAudioEqualizerGain:8.0f index:2];
-            [zegoApi setAudioEqualizerGain:0.0f index:3];
-            [zegoApi setAudioEqualizerGain:-2.0f index:4];
-            [zegoApi setAudioEqualizerGain:24.0f index:5];
-            [zegoApi setAudioEqualizerGain:24.0f index:6];
-            [zegoApi setAudioEqualizerGain:24.0f index:7];
-            [zegoApi setAudioEqualizerGain:24.0f index:8];
-            [zegoApi setAudioEqualizerGain:20.0f index:9];
+            // 【超级清晰】：全频段封顶功率输出 + 强化高频穿透
+            [zegoApi setAudioEqualizerGain:0.0f   index:0];
+            [zegoApi setAudioEqualizerGain:4.0f   index:1];
+            [zegoApi setAudioEqualizerGain:8.0f   index:2];
+            [zegoApi setAudioEqualizerGain:-2.0f  index:3];
+            [zegoApi setAudioEqualizerGain:-4.0f  index:4];
+            [zegoApi setAudioEqualizerGain:24.0f  index:5];
+            [zegoApi setAudioEqualizerGain:24.0f  index:6];
+            [zegoApi setAudioEqualizerGain:24.0f  index:7];
+            [zegoApi setAudioEqualizerGain:24.0f  index:8];
+            [zegoApi setAudioEqualizerGain:20.0f  index:9];
         }
     }
 }
 
-// ---------------------- 核心：台下直接开麦触发（业务层接口） ----------------------
+// ---------------------- 核心：台下直接开麦推流控制 ----------------------
 static void TriggerOffSeatSpeak(BOOL enable) {
-    Class audioMgrCls = NSClassFromString(@"SKAudioZegoManager");
-    Class roomMgrCls = NSClassFromString(@"SKVoiceRoomManager");
-
-    if (enable) {
-        // 1. 业务层绕过麦位，强制请求发言推流
-        if (audioMgrCls && [audioMgrCls respondsToSelector:@selector(sharedManager)]) {
-            id audioMgr = [audioMgrCls sharedManager];
-            if (audioMgr) {
-                if ([audioMgr respondsToSelector:@selector(enableMic:)]) {
-                    [audioMgr performSelector:@selector(enableMic:) withObject:@YES];
-                }
-                if ([audioMgr respondsToSelector:@selector(startPublish)]) {
-                    [audioMgr performSelector:@selector(startPublish)];
-                }
-            }
+    if (g_activeZegoManager) {
+        SKAudioZegoManager *mgr = (SKAudioZegoManager *)g_activeZegoManager;
+        if (enable) {
+            [mgr muteMic:NO];
+            [mgr startPublishing];
+        } else {
+            [mgr stopPublishing];
         }
+    }
 
-        // 2. 尝试向 1 号麦位发送虚拟绑定，走通业务推流
-        if (roomMgrCls) {
-            id roomMgr = nil;
-            if ([roomMgrCls respondsToSelector:@selector(shareInstance)]) {
-                roomMgr = [roomMgrCls shareInstance];
-            } else if ([roomMgrCls respondsToSelector:@selector(defaultManager)]) {
-                roomMgr = [roomMgrCls defaultManager];
-            }
-
-            if (roomMgr) {
-                if ([roomMgr respondsToSelector:@selector(takeSeat:)]) [roomMgr takeSeat:1];
-                if ([roomMgr respondsToSelector:@selector(reqUserMicroSeat:)]) [roomMgr reqUserMicroSeat:1];
-                if ([roomMgr respondsToSelector:@selector(joinMic)]) [roomMgr joinMic];
-            }
-        }
-    } else {
-        if (audioMgrCls && [audioMgrCls respondsToSelector:@selector(sharedManager)]) {
-            id audioMgr = [audioMgrCls sharedManager];
-            if (audioMgr && [audioMgr respondsToSelector:@selector(stopPublish)]) {
-                [audioMgr performSelector:@selector(stopPublish)];
-            }
+    if (g_activeZegoEngine) {
+        ZegoAudioRoomApi *api = (ZegoAudioRoomApi *)g_activeZegoEngine;
+        if (enable) {
+            [api enableMic:YES];
+            [api startPublish];
+        } else {
+            [api stopPublish];
         }
     }
 }
 
-// ---------------------- Hook 业务与底层 ----------------------
-%hook SKAudioRoomMicroSetting
-
-- (BOOL)isMute {
-    if (kForceOpenMic || kOffSeatSpeak) return NO;
-    return %orig;
-}
-
-- (BOOL)isUserOnMic:(NSString *)uid {
-    if (kOffSeatSpeak) return YES;
-    return %orig;
-}
-
-%end
-
+// ---------------------- Hook 业务与底层 SDK ----------------------
 %hook SKAudioZegoManager
-
-- (void)enableMic:(BOOL)enable {
-    if (kForceOpenMic || kOffSeatSpeak) {
-        %orig(YES);
-    } else {
-        %orig(enable);
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(g_activeZegoApi);
-    });
-}
-
-- (BOOL)micEnabled {
-    if (kForceOpenMic || kOffSeatSpeak) return YES;
-    return %orig;
-}
-
-%end
-
-%hook SKMicrophonePermissionManager
-
-+ (BOOL)hasMicrophonePermission {
-    if (kForceOpenMic || kOffSeatSpeak) return YES;
-    return %orig;
-}
-
-%end
-
-%hook ZegoLiveRoomApi
 
 - (id)init {
     id inst = %orig;
-    g_activeZegoApi = inst;
+    g_activeZegoManager = inst;
     return inst;
 }
 
-- (bool)loginRoom:(NSString *)roomID role:(int)role completionBlock:(id)block {
-    return %orig;
+- (void)setupENgine {
+    %orig;
+    g_activeZegoManager = self;
+    if (self.zegoEngine) {
+        g_activeZegoEngine = self.zegoEngine;
+    }
 }
 
-- (bool)loginRoom:(NSString *)roomID roomName:(NSString *)roomName role:(int)role completionBlock:(id)block {
-    return %orig;
+- (void)muteMic:(BOOL)mute {
+    if (kForceOpenMic || kOffSeatSpeak) {
+        %orig(NO);
+    } else {
+        %orig(mute);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+    });
 }
 
-- (bool)enableMic:(bool)enable {
-    g_activeZegoApi = self;
+- (void)startPublishing {
+    %orig;
+    g_activeZegoManager = self;
+    if (self.zegoEngine) {
+        g_activeZegoEngine = self.zegoEngine;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+    });
+}
+
+%end
+
+%hook SKAudioManager
+
+- (void)muteMic:(BOOL)mute {
+    if (kForceOpenMic || kOffSeatSpeak) {
+        %orig(NO);
+    } else {
+        %orig(mute);
+    }
+}
+
+%end
+
+%hook ZegoAudioRoomApi
+
+- (id)initWithAppID:(unsigned int)appID appSignature:(NSData *)appSignature {
+    id inst = %orig;
+    g_activeZegoEngine = inst;
+    return inst;
+}
+
+- (BOOL)enableMic:(BOOL)enable {
+    g_activeZegoEngine = self;
     if (kForceOpenMic || kOffSeatSpeak) return %orig(YES);
     return %orig(enable);
 }
 
-- (bool)setCaptureVolume:(int)volume {
-    g_activeZegoApi = self;
+- (void)setCaptureVolume:(int)volume {
+    g_activeZegoEngine = self;
     if (kCurrentFightMode != FightMode_Normal) {
         float baseGain = kNewFightGain;
         if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
         if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-        return %orig((int)(baseGain * kVoiceGainRatio));
+        %orig((int)(baseGain * kVoiceGainRatio));
+        return;
     }
-    return %orig(volume);
+    %orig(volume);
 }
 
-- (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo {
-    g_activeZegoApi = self;
-    bool res = %orig;
+- (BOOL)startPublish {
+    g_activeZegoEngine = self;
+    BOOL res = %orig;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(self);
+        ApplyCrystalLoudVoiceDSP(self);
     });
     return res;
 }
 
-- (bool)startPublishing2:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo params:(NSString *)params channelIndex:(int)channelIndex {
-    g_activeZegoApi = self;
-    bool res = %orig;
+- (BOOL)startPublishWithStreamID:(NSString *)streamID {
+    g_activeZegoEngine = self;
+    BOOL res = %orig;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(self);
+        ApplyCrystalLoudVoiceDSP(self);
     });
     return res;
 }
 
-- (bool)startPublishWithParams:(id)params {
-    g_activeZegoApi = self;
-    bool res = %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(self);
-    });
-    return res;
+- (void)stopPublish {
+    // 台下开麦开启时，拦截下麦停止推流指令
+    if (kOffSeatSpeak) {
+        return;
+    }
+    %orig;
 }
 
 %end
@@ -319,9 +296,9 @@ static void StartKeepAliveService() {
         g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
         dispatch_source_set_event_handler(g_keepAliveTimer, ^{
-            if (g_activeZegoApi && (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak)) {
+            if (g_activeZegoEngine && (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak)) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    ApplyPreciseRadioFightDSP(g_activeZegoApi);
+                    ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
                 });
             }
         });
@@ -429,7 +406,7 @@ static void StartKeepAliveService() {
 }
 
 - (void)setupDebugPage {
-    NSArray *items = @[@"新清晰音量 (默认800)", @"旧清晰音量 (默认1500)", @"超级清晰音量 (默认2500)", @"人声音量权重"];
+    NSArray *items = @[@"新清晰音量 (默认400)", @"旧清晰音量 (默认600)", @"超级清晰音量 (默认1000)", @"人声音量权重"];
     for (int i = 0; i < items.count; i++) {
         CGFloat y = 8 + i * 58;
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, self.debugPageView.frame.size.width - 24, 16)];
@@ -440,10 +417,10 @@ static void StartKeepAliveService() {
 
         UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(12, y + 18, self.debugPageView.frame.size.width - 24, 20)];
         slider.tag = 500 + i;
-        if (i == 0) { slider.minimumValue = 100; slider.maximumValue = 1500; slider.value = kNewFightGain; }
-        if (i == 1) { slider.minimumValue = 500; slider.maximumValue = 2500; slider.value = kOldFightGain; }
-        if (i == 2) { slider.minimumValue = 1000; slider.maximumValue = 4000; slider.value = kSuperFightGain; }
-        if (i == 3) { slider.minimumValue = 0.5f; slider.maximumValue = 2.0f; slider.value = kVoiceGainRatio; }
+        if (i == 0) { slider.minimumValue = 100; slider.maximumValue = 800;  slider.value = kNewFightGain; }
+        if (i == 1) { slider.minimumValue = 300; slider.maximumValue = 1200; slider.value = kOldFightGain; }
+        if (i == 2) { slider.minimumValue = 500; slider.maximumValue = 2000; slider.value = kSuperFightGain; }
+        if (i == 3) { slider.minimumValue = 0.5f; slider.maximumValue = 2.0f;  slider.value = kVoiceGainRatio; }
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
     }
@@ -459,7 +436,7 @@ static void StartKeepAliveService() {
     if (s.tag == 501) kOldFightGain = s.value;
     if (s.tag == 502) kSuperFightGain = s.value;
     if (s.tag == 503) kVoiceGainRatio = s.value;
-    ApplyPreciseRadioFightDSP(g_activeZegoApi);
+    ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
 }
 
 - (void)onFuncSwitch:(UISwitch *)s {
@@ -480,7 +457,7 @@ static void StartKeepAliveService() {
         if (s.isOn) { kCurrentFightMode = FightMode_Super; [self.swNewFight setOn:NO animated:YES]; [self.swOldFight setOn:NO animated:YES]; }
         else { kCurrentFightMode = FightMode_Normal; }
     }
-    ApplyPreciseRadioFightDSP(g_activeZegoApi);
+    ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)p {
