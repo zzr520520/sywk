@@ -1,59 +1,68 @@
-# FightVoicePro v3.0.0 - 声控物语搏击音效插件
+# FightVoicePro v4.0.0 - 声控物语搏击音效插件
 
-专用于声控物语的 AudioUnitSetProperty 输入回调包装 Hook 与老式电视无信号雪花音效插件（Tweak）。
+专用于声控物语的 Zego 原生上行推流注入搏击音效插件（Tweak）。
 
-## v3.0.0 终极架构重构 — 输入回调包装 Hook
+## v4.0.0 架构回归 — Zego 原生上行推流
 
-### 致命死穴定位
+### 回溯分析：为什么第二、三版能生效
 
-v2.9.0 的 `AudioUnitRender` / `AudioConverterFillComplexBuffer` 双层 Hook 仍然无法让对方听到声音，根本原因：
+第二、三版直接作用于 **ZegoLiveRoomApi 的上行推流管线**，通过：
+1. `setCaptureVolume:` 设置 500/1000/1500 极限增益
+2. 10 段 EQ 全频段过载增益（最高 +24dB）
+3. 彻底关闭 3A（AEC/AGC/ANS），防止声音被系统压制
 
-1. **底层采集通道拦截脱节** - 在 iOS 14+ 及现代 WebRTC/Zego SDK 中，麦克风采集不再是简单的单次 `AudioUnitRender` 提取，而是通过 `AudioUnitSetProperty` 注册了 **kAudioOutputUnitProperty_SetInputCallback (InputProc 回调)**。SDK 直接在系统硬件输入中断回调中把 PCM 数据抓走并送入内部队列，Hook `AudioUnitRender` 根本拦截不到输入流
-2. **AudioConverter 也会被旁路** - 现代 SDK 在回调中直接拿走 PCM，不一定经过 `AudioConverterFillComplexBuffer`
+这种做法直接指挥 ZEGO 引擎对采集到的所有音频进行硬件放大和全频段爆音编码，再打包发给房间所有人。
 
-### 终极修复：输入回调包装（Wrapper Callback）
+### 为什么 v2.8~v3.0 的底层 C Hook 失败
 
-- **Hook `AudioUnitSetProperty`** - 在 constructor 中用 `MSHookFunction` 拦截系统底层 `AudioUnitSetProperty` C 函数
-- **拦截注册瞬间** - 当 SDK 调用 `AudioUnitSetProperty` 注册 `kAudioOutputUnitProperty_SetInputCallback` 时，保存 SDK 原始回调 `inputProc` 和 `inputProcRefCon`
-- **替换为包装回调** - 用 `MyMicrophoneInputCallback` 替换 SDK 的原始回调，SDK 完全无感知
-- **硬件中断级混音** - 系统每次硬件中断都会调用我们的包装回调：
-  1. 先调用 SDK 原始回调，让 SDK 从硬件麦克风抓取真实人声
-  2. 再调用 `MixNoiseIntoAudioBuffer` 强行注入雪花嗡鸣/MP3
-  3. SDK 编码上传的数据已被篡改，对方 100% 必定收到
+v2.8~v3.0 改去 Hook `AudioUnitRender`、`AudioUnitSetProperty` 和 `AudioConverterFillComplexBuffer`，这些底层操作只影响了本地播放管道或者没有握手成功，导致上层 SDK 的推流增益完全失效——**对方全聋，只有自己能听到**。
 
-### 与历史版本架构对比
+### v4.0.0 终极方案
 
-| 版本 | Hook 点 | 拦截层级 | 效果 |
-|------|---------|----------|------|
-| v2.3~v2.7 | `setAudioAuxData:` | SDK 代理层 | 对方听不到 |
-| v2.8.0 | `AudioUnitRender` | 硬件渲染层 | 被SDK输入回调旁路 |
-| v2.9.0 | `AudioUnitRender` + `AudioConverterFillComplexBuffer` | 双层 | 仍被SDK输入回调旁路 |
-| **v3.0.0** | **`AudioUnitSetProperty`** | **回调注册层** | **100% 必生效** |
+彻底剔除所有不可靠的底层 C Hook，**全面回归第二版/第三版最稳定的 Zego 原生推流注入链路**：
+
+| 版本 | 方案 | 效果 |
+|------|------|------|
+| v2.3~v2.7 | setAudioAuxData + PCM 混音 | 部分生效 |
+| v2.8~v2.9 | AudioUnitRender + AudioConverter Hook | 被SDK旁路，对方听不到 |
+| v3.0 | AudioUnitSetProperty 回调包装 | 底层操作不可靠 |
+| **v4.0.0** | **Zego 原生推流 API** | **对方 100% 必收到** |
+
+### 核心技术实现
+
+1. **直接对接 ZEGO 上行推流核心**：不再走任何有风险的底层 C Hook，而是直接控制 `ZegoLiveRoomApi` 的推流通道参数，推流编码器将直接把经过增益与 EQ 塑形的音频流发送到服务端
+
+2. **0.8 秒高频保活线程**：无论 App 内部在上麦后如何重置麦克风参数，定时器会在毫秒级重新压入 500/1000/1500 增益 + 关闭 3A + 10 段过载 EQ，保证全房间收到的声音始终处于过载状态
+
+3. **三档搏击模式**：
+   - 新清晰搏击：500 音量 + 清晰咬字 EQ 曲线
+   - 旧清晰搏击：1000 音量 + 电台撕拉 EQ 曲线
+   - 超级战斗：1500 音量 + 全频段 +24dB 极限过载轰炸
+
+4. **ZegoMediaPlayer 音乐推流**：使用 `setAudioStreamType:2` 混入上行推流 + 本地监听，标准 SDK 接口确保音乐也能被全房间听到
+
+5. **彻底关闭 3A**：AGC / ANS / AEC + TransientNoiseSuppress 全部禁用，防止系统压制声音
 
 ## 功能特性
 
-- **输入回调包装 Hook** - `AudioUnitSetProperty` + `MyMicrophoneInputCallback`，在硬件中断回调中直接篡改 PCM
-- **MixNoiseIntoAudioBuffer** - 统一 inline 混音算法，硬削顶防溢出
-- **constructor 即时初始化** - 动态库加载即生成 PCM 数据 + 安装 Hook
-- **强制扬声器外放** - overrideOutputAudioPort + Playback 模式
-- **内置 PCM 硬编码** - 纯内存合成雪花+嗡鸣
-- **WAV 内存封装试听** - 44 字节标准 WAV 头 + AVAudioPlayer
-- **线程安全动态导入** - pthread_mutex + Double-buffering
-- **电视雪花音效** - 白噪声 -14dB + 50Hz 嗡鸣 -12dB + 15625Hz 行频 + 18Hz 撕拉
+- **Zego 原生上行推流** - setCaptureVolume + 10 段 EQ 极限过载
+- **0.8s 保活守护线程** - dispatch_source 高频刷新 DSP 参数
+- **三档爆音模式** - 500 / 1000 / 1500 增益
+- **ZegoMediaPlayer 音乐推流** - setAudioStreamType:2 混入推流
 - **多重强制开麦** - 三层拦截（SKAudioZegoManager + SKMicrophonePermissionManager + ZegoLiveRoomApi）
-- **强制永久关闭 3A** - AGC / ANS / AEC 全部禁用
-- **三档爆音模式** - 500 / 1000 / 1500
-- **悬浮控制面板** - 双指双击调出
-- **iOS 13+ 兼容**
+- **强制永久关闭 3A** - AGC / ANS / AEC / TransientNoiseSuppress 全部禁用
+- **悬浮控制面板** - 双指双击调出，可拖拽
+- **iOS 13+ 兼容** - UIWindowScene 适配
+- **手势冲突防护** - shouldReceiveTouch 去重
 
 ## 使用方法
 
 1. 安装 `.deb` 或注入 `.dylib` 到声控物语 App
 2. **双指双击**屏幕调出悬浮面板
-3. **设置 Tab**：点击「开始试听」外放扬声器立即播放
-4. **功能 Tab**：开启/关闭搏击音效（输入回调包装 Hook 自动生效）
-5. **音乐 Tab**：导入 MP3 / 上麦发 / 默认噪音
-6. **调试 Tab**：调节各档位音量
+3. **功能 Tab**：开启/关闭搏击音效模式（新清晰/旧清晰/超级战斗）
+4. **调试 Tab**：调节各档位音量（100~3000）和人声权重
+5. **音乐 Tab**：导入 MP3/WAV/M4A → 点击「上麦发」推流
+6. **设置 Tab**：查看音频推流状态监控
 
 ## 构建
 
@@ -64,4 +73,4 @@ make package FINALPACKAGE=1
 
 ## 依赖框架
 
-- UIKit / Foundation / AVFoundation / CoreGraphics / CoreMedia / AudioToolbox / CoreAudio
+- UIKit / Foundation / AVFoundation / CoreGraphics

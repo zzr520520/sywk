@@ -6,6 +6,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = FightVoicePro
 FightVoicePro_FILES = Tweak.x
 FightVoicePro_CFLAGS = -fobjc-arc -O3 -Wno-error -Wno-deprecated-declarations
-FightVoicePro_FRAMEWORKS = UIKit Foundation AVFoundation CoreGraphics CoreMedia AudioToolbox CoreAudio
+FightVoicePro_FRAMEWORKS = UIKit Foundation AVFoundation CoreGraphics
 
 include $(THEOS_MAKE_PATH)/tweak.mk
