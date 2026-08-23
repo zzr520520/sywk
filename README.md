@@ -1,42 +1,51 @@
-# FightVoicePro v7.3.0 - 声控物语搏击音效插件
+# FightVoicePro v7.5.0 - 声控物语搏击音效插件
 
-修复被踢下麦后"全哑"问题，实现被踢后仍能正常收听房间所有人声音 + 台下直接开麦推流。
+终极防掐断方案：彻底拦截角色降级 + 推流心跳保护 + 拉流列表防清空 + 周期性拉流恢复，实现被踢/下麦后持续推流与收听。
 
-## v7.3.0 核心突破 — 防被踢全哑 + 拉流保活
+## v7.5.0 核心升级 — 终极防掐断闭环
 
-### 一、被踢下麦全哑问题根因
+### 一、v7.5.0 新增改进（在 v7.4.0 基础上）
 
-根据逆向报告 5.2.2、7.3、9.1.1 节分析：
+| 改进点 | v7.4.0 | v7.5.0 |
+|--------|--------|--------|
+| `changeRoleToChat:` | `%orig(1)` 仍调原始方法 | **完全 `return`**，不触发任何降级副作用 |
+| `saveStreamListAll:` | 未拦截 | **新增 Hook**，保存后立即恢复播放 |
+| `onStreamUpdated:` | 恢复拉流 | **增加 `muteMic:NO`**，流变动后重新开麦 |
+| 保活线程 | 仅 `enableSpeaker` | **增加周期 `checkAllStreams`**，防止流列表被清空 |
 
-| 根因 | 详情 |
-|------|------|
-| 下麦级联静音 | 被踢时 App 调用 muteAllRemote:YES + removeStreamListAll |
-| 服务端鉴权 | 服务端标记 UID 非麦位状态，其他人 stopPlayStream 你的流 |
-| 拉流引擎注销 | 被踢后甚至注销拉流引擎，导致你完全听不到任何声音 |
-
-### 二、防全哑修复方案
-
-| 修复点 | 实现 |
-|--------|------|
-| 拦截 muteAllRemote: | 强制传参 NO，被踢后远端声音不静音 |
-| 拦截 enableSpeaker: | 强制传参 YES，扬声器始终开启 |
-| stopPublishing 后恢复 | 调用 muteAllRemote:NO + checkAllStreams 重新拉起拉流 |
-| 保活线程锁定 | 0.8s 持续调用 enableSpeaker:YES |
-| 台下开麦联动 | TriggerOffSeatSpeak 同时执行 muteAllRemote:NO + enableSpeaker:YES + checkAllStreams |
-
-### 三、防全哑拦截链路
+### 二、完整防掐断拦截链路
 
 ```
-被踢下麦触发
-  ├─ muteAllRemote:YES  → 拦截为 muteAllRemote:NO (远端不静音)
-  ├─ enableSpeaker:NO   → 拦截为 enableSpeaker:YES (扬声器不关)
-  ├─ stopPublishing     → 台下开麦时拦截 / 否则执行后恢复拉流
-  ├─ stopPublish        → 台下开麦时拦截
-  └─ checkAllStreams    → 重新绑定 allStreamList 拉流列表
+被踢/下麦触发
+  ├─ changeRoleToChat:    → 完全return拦截（不调%orig，零副作用）
+  ├─ setStartPushTimer:   → timer==nil时拦截（保住推流心跳）
+  ├─ removeStreamListAll  → 拒绝清空拉流列表
+  ├─ saveStreamListAll:  → 保存后立即恢复播放（新增）
+  ├─ muteAllRemote:      → 强制NO
+  ├─ enableSpeaker:      → 强制YES
+  ├─ stopPublishing      → 台下开麦时拦截
+  ├─ stopPublish         → 台下开麦时拦截
+  └─ onStreamUpdated:    → 恢复拉流+重新开麦+checkAllStreams
 
 保活线程 (0.8s)
-  └─ enableSpeaker:YES  → 持续锁定扬声器开启
+  ├─ enableSpeaker:YES   → 持续锁定扬声器
+  ├─ ApplyCrystalDSP     → 刷新增益+EQ参数
+  └─ checkAllStreams      → 周期性拉流恢复（新增）
 ```
+
+### 三、防掐断拦截对照表
+
+| 拦截目标 | 方法 | 拦截策略 | 报告章节 |
+|----------|------|----------|----------|
+| 角色降级 | `changeRoleToChat:` | 完全return，不调%orig | 4.2.2 |
+| 推流心跳销毁 | `setStartPushTimer:` | timer==nil时拦截 | 4.2.2 |
+| 拉流列表清空 | `removeStreamListAll` | 强制开麦/台下开麦时拒绝 | 4.2.2 |
+| 拉流列表保存 | `saveStreamListAll:` | 保存后立即恢复播放 | 4.2.2 |
+| 远端流变动 | `onStreamUpdated:stream:` | 恢复拉流+重新开麦 | 4.2.2 |
+| 远端静音 | `muteAllRemote:` | 强制NO | 3.2.1 |
+| 扬声器关闭 | `enableSpeaker:` | 强制YES | 3.2.1 |
+| 底层停推 | `stopPublish` | 台下开麦时拦截 | 3.2.1 |
+| 业务层停推 | `stopPublishing` | 台下开麦时拦截 | 8.2 |
 
 ### 四、三档清晰模式
 
@@ -63,15 +72,16 @@
 
 ## 功能特性
 
-- **防被踢全哑** - 拦截 muteAllRemote + enableSpeaker 强制锁定
-- **拉流保活恢复** - stopPublishing 后自动 checkAllStreams 重新拉流
+- **终极防掐断** - changeRoleToChat 完全return + startPushTimer保护 + removeStreamListAll拦截
+- **拉流双重保护** - removeStreamListAll拒绝清空 + saveStreamListAll保存后恢复
+- **周期拉流恢复** - 0.8s保活线程增加checkAllStreams
+- **流变动重新开麦** - onStreamUpdated触发muteMic:NO
 - **ZegoAudioRoomApi 正确类名** - 逆向报告确认的真实引擎类
 - **业务层双管台下开麦** - SKAudioZegoManager + ZegoAudioRoomApi 协同推流
 - **stopPublish/stopPublishing 双拦截** - 台下开麦时防止 App 终止推流
 - **封顶纯净增益** - 400/600/1000 消除方波失真
 - **纯净人声** - 彻底移除所有背景音效
 - **高通切除** - 31Hz~500Hz 削减，释放动态空间
-- **0.8s 保活线程** - enableSpeaker 持续锁定 + DSP 参数刷新
 - **iOS 13+ 兼容** - UIWindowScene 适配 + 手势去重
 
 ## 使用方法

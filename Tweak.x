@@ -28,11 +28,13 @@ static void StartKeepAliveService(void);
 static UIWindow *GetKeyWindow(void);
 static void TriggerOffSeatSpeak(BOOL enable);
 
-// ---------------------- 接口声明 (严格对齐逆向报告) ----------------------
+// ---------------------- 接口声明 (严格对齐逆向报告 8.2/8.5 节) ----------------------
 @interface ZegoAudioRoomApi : NSObject
+@property (nonatomic, strong) id liveRoomApi; // 报告8.5确认: ZegoLiveRoomApi *liveRoomApi
 - (BOOL)startPublish;
 - (BOOL)startPublishWithStreamID:(NSString *)streamID;
 - (void)stopPublish;
+- (BOOL)startPlayStream:(NSString *)streamID;
 - (BOOL)enableMic:(BOOL)enable;
 - (BOOL)enableSpeaker:(BOOL)enable;
 - (void)setCaptureVolume:(int)volume;
@@ -40,7 +42,6 @@ static void TriggerOffSeatSpeak(BOOL enable);
 - (bool)enableNoiseSuppress:(bool)enable;
 - (bool)enableAEC:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
-- (BOOL)startPlayStream:(NSString *)streamID;
 @end
 
 @interface SKAudioZegoManager : NSObject
@@ -48,20 +49,27 @@ static void TriggerOffSeatSpeak(BOOL enable);
 @property (nonatomic, strong) ZegoAudioRoomApi *zegoEngine;
 @property (nonatomic, strong) NSArray *allStreamList;
 @property (nonatomic, strong) NSArray *streamList;
+@property (nonatomic, strong) NSTimer *startPushTimer;  // 报告8.2确认: 推流心跳定时器
 @property (nonatomic, copy) NSString *roomId;
 @property (nonatomic, copy) NSString *userId;
+- (void)setupENgine;
 - (void)startPublishing;
 - (void)stopPublishing;
 - (void)muteMic:(BOOL)mute;
 - (void)muteAllRemote:(BOOL)mute;
 - (BOOL)enableSpeaker:(BOOL)enable;
 - (void)checkAllStreams;
+- (void)changeRoleToChat:(NSInteger)role;
+- (void)removeStreamListAll;       // 报告4.2.2确认
+- (void)saveStreamListAll:(NSArray *)streams;
+- (void)onStreamUpdated:(NSUInteger)type stream:(NSArray *)streams;
 @end
 
 @interface SKAudioManager : NSObject
 @property (nonatomic, strong) SKAudioZegoManager *manager;
 - (void)muteMic:(BOOL)mute;
 - (BOOL)enableSpeaker:(BOOL)enable;
+- (void)changeRoleToChat:(NSInteger)role;
 @end
 
 // ---------------------- 兼容 iOS 13+ 获取 keyWindow ----------------------
@@ -166,7 +174,7 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     }
 }
 
-// ---------------------- 核心：台下开麦与防下麦全哑 ----------------------
+// ---------------------- 核心：台下直接开麦与拉流防断 ----------------------
 static void TriggerOffSeatSpeak(BOOL enable) {
     if (g_activeZegoManager) {
         SKAudioZegoManager *mgr = (SKAudioZegoManager *)g_activeZegoManager;
@@ -182,17 +190,6 @@ static void TriggerOffSeatSpeak(BOOL enable) {
         }
         // 重新拉起拉流列表，确保听得到所有人
         [mgr checkAllStreams];
-    }
-
-    if (g_activeZegoEngine) {
-        ZegoAudioRoomApi *api = (ZegoAudioRoomApi *)g_activeZegoEngine;
-        [api enableSpeaker:YES];
-        if (enable) {
-            [api enableMic:YES];
-            [api startPublish];
-        } else {
-            [api stopPublish];
-        }
     }
 }
 
@@ -213,14 +210,21 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     }
 }
 
-// 拦截下麦静音远端（解决被踢后全哑、听不到任何声音的问题）
+// 1. 拦截下麦时的角色降级（防止被服务端定时器掐断）
+// v7.5.0: 彻底拦截，不调用原始方法，避免 changeRoleToChat: 内部副作用导致推流中断
+- (void)changeRoleToChat:(NSInteger)role {
+    if (kOffSeatSpeak) {
+        return;
+    }
+    %orig(role);
+}
+
+// 2. 拦截静音所有远端（彻底解决听不到对方声音的问题）
 - (void)muteAllRemote:(BOOL)mute {
-    // 强制不静音远端声音，始终保证能听到房内其他人
     %orig(NO);
 }
 
 - (BOOL)enableSpeaker:(BOOL)enable {
-    // 强制开启扬声器
     return %orig(YES);
 }
 
@@ -235,13 +239,12 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     });
 }
 
+// 3. 拦截下麦停推指令（解决下麦后1秒被掐断的问题）
 - (void)stopPublishing {
     if (kOffSeatSpeak) {
-        // 台下开麦开启时，拦截停止推流指令
         return;
     }
     %orig;
-    // 下麦后强制恢复拉流，防止声音中断
     [self muteAllRemote:NO];
     [self checkAllStreams];
 }
@@ -256,6 +259,46 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
     });
+}
+
+// 4. 拦截 removeStreamListAll（防止被踢时拉流列表被清空导致全哑）
+- (void)removeStreamListAll {
+    if (kForceOpenMic || kOffSeatSpeak) {
+        // 台下开麦/强制开麦时，拒绝清空拉流列表
+        return;
+    }
+    %orig;
+}
+
+// 4b. v7.5.0: 拦截 saveStreamListAll:（确保流列表保存后立即恢复播放）
+- (void)saveStreamListAll:(NSArray *)streams {
+    %orig(streams);
+    if (kForceOpenMic || kOffSeatSpeak) {
+        [self muteAllRemote:NO];
+        [self enableSpeaker:YES];
+        [self checkAllStreams];
+    }
+}
+
+// 5. 远端流变动时，始终保证拉流播放
+- (void)onStreamUpdated:(NSUInteger)type stream:(NSArray *)streams {
+    %orig(type, streams);
+    // 流更新后强制恢复拉流 + 重新开麦
+    [self muteAllRemote:NO];
+    [self enableSpeaker:YES];
+    if (kForceOpenMic || kOffSeatSpeak) {
+        [self muteMic:NO];
+    }
+    [self checkAllStreams];
+}
+
+// 6. 拦截 startPushTimer 的销毁（防止推流心跳被掐断）
+- (void)setStartPushTimer:(NSTimer *)timer {
+    if (kOffSeatSpeak && timer == nil) {
+        // 台下开麦时，拒绝清除推流心跳定时器
+        return;
+    }
+    %orig(timer);
 }
 
 %end
@@ -274,6 +317,13 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     return %orig(YES);
 }
 
+- (void)changeRoleToChat:(NSInteger)role {
+    if (kOffSeatSpeak) {
+        return;
+    }
+    %orig(role);
+}
+
 %end
 
 %hook ZegoAudioRoomApi
@@ -285,7 +335,7 @@ static void TriggerOffSeatSpeak(BOOL enable) {
 }
 
 - (BOOL)enableSpeaker:(BOOL)enable {
-    return %orig(YES); // 始终保证接收音频流
+    return %orig(YES);
 }
 
 - (BOOL)enableMic:(BOOL)enable {
@@ -304,24 +354,6 @@ static void TriggerOffSeatSpeak(BOOL enable) {
         return;
     }
     %orig(volume);
-}
-
-- (BOOL)startPublish {
-    g_activeZegoEngine = self;
-    BOOL res = %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyCrystalLoudVoiceDSP(self);
-    });
-    return res;
-}
-
-- (BOOL)startPublishWithStreamID:(NSString *)streamID {
-    g_activeZegoEngine = self;
-    BOOL res = %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyCrystalLoudVoiceDSP(self);
-    });
-    return res;
 }
 
 - (void)stopPublish {
@@ -343,13 +375,20 @@ static void StartKeepAliveService() {
         dispatch_source_set_event_handler(g_keepAliveTimer, ^{
             if (g_activeZegoEngine) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    // 持续保持远端声音不断开
                     if ([g_activeZegoEngine respondsToSelector:@selector(enableSpeaker:)]) {
                         [g_activeZegoEngine enableSpeaker:YES];
                     }
                     if (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak) {
                         ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
                     }
+                });
+            }
+            // v7.5.0: 定期检查拉流列表，防止被踢后流列表被清空导致全哑
+            if (g_activeZegoManager && (kForceOpenMic || kOffSeatSpeak)) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    SKAudioZegoManager *mgr = (SKAudioZegoManager *)g_activeZegoManager;
+                    [mgr muteAllRemote:NO];
+                    [mgr checkAllStreams];
                 });
             }
         });
