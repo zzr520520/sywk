@@ -2,7 +2,7 @@ Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
 Version: 2.8.0
 Architecture: iphoneos-arm64
-Description: 声控物语Pull模式代理注入+ZegoAudioAuxProvider+彻底清除GCD定时器+零丢帧
+Description: CoreAudio AudioUnitRender 硬件级混音+MSHookFunction底层拦截+绕过SDK限制+Pull代理双保险+零丢帧
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks

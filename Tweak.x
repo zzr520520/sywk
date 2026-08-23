@@ -2,6 +2,8 @@
 #import <substrate.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudioTypes.h>
 #import <math.h>
 #import <stdlib.h>
 #import <pthread.h>
@@ -60,6 +62,15 @@ static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int 
 static void LoadMP3ToPCM(NSString *filePath);
 static void ApplyPreciseRadioFightDSP(id zegoApi);
 static void StartKeepAliveService(void);
+
+// ---------------------- CoreAudio 底层 Hook ----------------------
+// 原始 AudioUnitRender 函数指针
+static OSStatus (*orig_AudioUnitRender)(AudioUnit inUnit,
+                                         AudioUnitRenderActionFlags *ioActionFlags,
+                                         const AudioTimeStamp *inTimeStamp,
+                                         UInt32 inOutputBusNumber,
+                                         UInt32 inNumberFrames,
+                                         AudioBufferList *ioData);
 
 // ---------------------- 路径辅助 ----------------------
 static NSString *GetSafeDir(NSString *subDir) {
@@ -697,13 +708,13 @@ static void StartKeepAliveService() {
         NSArray *info = @[
             @"FightVoicePro v2.8.0",
             @"",
-            @"推流模式: Pull 代理注入 (标准模式)",
-            @"  ZegoAudioAuxProvider 单例",
-            @"  onAudioAuxData:dataLen:",
-            @"  引擎20ms索取, 零丢帧",
+            @"推流模式: CoreAudio 底层 Hook",
+            @"  MSHookFunction(AudioUnitRender)",
+            @"  硬件级 PCM 混音, 绕过SDK",
+            @"  + Pull 代理双保险",
             @"",
             @"内置PCM: 纯内存硬编码合成",
-            @"  constructor注入即生成",
+            @"  constructor注入即生成+安装Hook",
             @"  白噪声 -14dB + 50Hz嗡鸣 -12dB",
             @"  15625Hz行频 + 18Hz撕拉切音",
             @"",
@@ -712,9 +723,10 @@ static void StartKeepAliveService() {
             @"  强制外放 overrideOutputAudioPort",
             @"  Playback模式 + MixWithOthers",
             @"",
-            @"Aux 混音: 三步联动",
-            @"  setAudioAuxDelegate: + enableAux:",
-            @"  + setAudioCaptureShiftOnMix:",
+            @"底层混音: 硬件级强制覆盖",
+            @"  AudioUnitRender 拦截后",
+            @"  人声×baseVol + 噪音×gain",
+            @"  硬削顶 [-32768, 32767]",
             @"",
             @"线程安全: pthread_mutex + Double-buffering",
             @"3A 状态: AGC/ANS/AEC 强制关闭",
@@ -1054,7 +1066,82 @@ static NSTimeInterval g_lastTapStamp = 0;
 
 %end
 
-// ---------------------- 构造函数: 动态库加载即初始化 PCM 数据 ----------------------
+// ---------------------- CoreAudio 底层混音 Hook 实现 ----------------------
+// 无论上层 App 怎么封装、无论 SDK 用什么代理，只要手机麦克风开始录音，
+// 底层 PCM 内存就会被强制覆盖并混入雪花嗡鸣与 MP3，对方 100% 必定收到。
+static OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
+                                        AudioUnitRenderActionFlags *ioActionFlags,
+                                        const AudioTimeStamp *inTimeStamp,
+                                        UInt32 inOutputBusNumber,
+                                        UInt32 inNumberFrames,
+                                        AudioBufferList *ioData) {
+    // 1. 先调用原始函数拿到录音 PCM 数据
+    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
+                                           inOutputBusNumber, inNumberFrames, ioData);
+
+    // 2. 录音渲染成功且处于战斗模式时，在底层强制混入雪花嗡鸣
+    if (status == noErr && ioData != NULL && kCurrentFightMode != FightMode_Normal) {
+        // 根据战斗模式确定增益乘法器
+        float gainMultiplier = 1.0f;
+        float baseVolMultiplier = (kNewFightGain / 100.0f) * kVoiceGainRatio;
+
+        if (kCurrentFightMode == FightMode_Old) {
+            gainMultiplier = 1.6f;
+            baseVolMultiplier = (kOldFightGain / 100.0f) * kVoiceGainRatio;
+        } else if (kCurrentFightMode == FightMode_Super) {
+            gainMultiplier = 2.4f;
+            baseVolMultiplier = (kSuperFightGain / 100.0f) * kVoiceGainRatio;
+        }
+
+        pthread_mutex_lock(&g_pcmMutex);
+        // 遍历所有音频缓冲区（单声道/多声道均支持）
+        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+            AudioBuffer buffer = ioData->mBuffers[b];
+            if (buffer.mData == NULL || buffer.mDataByteSize == 0) continue;
+
+            int16_t *samples = (int16_t *)buffer.mData;
+            UInt32 sampleCount = buffer.mDataByteSize / sizeof(int16_t);
+
+            for (UInt32 i = 0; i < sampleCount; i++) {
+                // 从环形缓冲区取出背景噪音样本
+                int16_t bgSample = 0;
+                if (g_customPcmBuffer && g_customPcmSize > 0) {
+                    // 自定义 MP3 数据
+                    bgSample = g_customPcmBuffer[g_customPcmOffset++];
+                    if (g_customPcmOffset >= g_customPcmSize) g_customPcmOffset = 0;
+                } else {
+                    // 内置雪花嗡鸣数据
+                    bgSample = g_embeddedPcmBuffer[g_embeddedPcmOffset++];
+                    if (g_embeddedPcmOffset >= EMBEDDED_PCM_LEN) g_embeddedPcmOffset = 0;
+                }
+
+                // 强制在底层把录音数据与雪花嗡鸣混合并过载放大
+                float voice = (float)samples[i] * baseVolMultiplier;
+                float noise = (float)bgSample * gainMultiplier;
+                float mixed = voice + noise;
+
+                // 硬削顶防溢出爆裂
+                if (mixed > 32767.0f) mixed = 32767.0f;
+                if (mixed < -32768.0f) mixed = -32768.0f;
+
+                samples[i] = (int16_t)mixed;
+            }
+        }
+        pthread_mutex_unlock(&g_pcmMutex);
+    }
+
+    return status;
+}
+
+// ---------------------- 构造函数: 动态库加载即初始化 PCM 数据 + 安装底层 Hook ----------------------
 __attribute__((constructor)) static void InitializeTweak() {
+    // 1. 注入瞬间立即生成内置 PCM 雪花嗡鸣数据
     InitEmbeddedPCMData();
+
+    // 2. 动态挂钩 CoreAudio 系统底层渲染 C 函数
+    //    所有 iOS 音频框架最终都必须调用 AudioUnitRender
+    //    无论 ZEGO / WebRTC / AVFoundation，底层 PCM 必定被拦截
+    MSHookFunction((void *)AudioUnitRender,
+                   (void *)hooked_AudioUnitRender,
+                   (void **)&orig_AudioUnitRender);
 }

@@ -4,10 +4,12 @@
 
 ## v2.8.0 核心重构
 
-- **Pull 模式代理注入** - 实现标准 `ZegoAudioAuxProvider` 单例代理，挂载至 `setAudioAuxDelegate:`；引擎每隔 20ms 向代理请求一次数据（`onAudioAuxData:dataLen:sampleRate:channelCount:`），代理直接将内存 PCM 拷贝至 SDK 提供的目标缓冲区，由 SDK 负责与麦克风通道混流并推向远端，完全不丢帧、不卡顿
+- **CoreAudio 底层 Hook** - 使用 `MSHookFunction` 拦截系统底层 `AudioUnitRender` C 函数，在硬件渲染层直接修改 PCM 内存，将麦克风录音数据与雪花嗡鸣强制混合并过载放大后推向远端。所有 iOS 音频框架（ZEGO / WebRTC / AVFoundation）最终都必须调用 `AudioUnitRender`，因此无论 App/SDK 如何配置，对方 100% 必定收到混音
+- **Pull 代理双保险** - 保留 `ZegoAudioAuxProvider` 标准 Pull 模式代理作为 SDK 层补充，与底层 CoreAudio Hook 形成双重保障
 - **彻底清除 GCD 定时器** - 移除 `g_auxPushTimer` 和 `StartAuxDataInjector()`，消除死锁隐患与推流时序问题
-- **增益乘法器** - Pull 代理内根据战斗模式动态应用增益乘法器（1.0x / 1.6x / 2.4x），直接在 PCM 数据拷贝时放大
-- **双签名兼容** - `onAudioAuxData:` 标准签名 + `channelIndex:` 扩展签名，覆盖不同 SDK 版本
+- **增益乘法器** - CoreAudio Hook 内根据战斗模式动态应用增益乘法器（1.0x / 1.6x / 2.4x），直接在 PCM 数据写入时放大
+- **硬削顶防溢出** - 混音后 float 值钳位至 [-32768, 32767]，防止 int16 溢出爆裂
+- **constructor 即时安装** - 动态库加载瞬间执行 `InitEmbeddedPCMData()` + `MSHookFunction(AudioUnitRender, ...)`
 
 ## v2.7.0 核心修复
 
@@ -32,19 +34,22 @@
 
 ## 推流架构对比
 
-| 方案 | v2.3~v2.7 (Push) | v2.8.0 (Pull) |
+| 方案 | v2.3~v2.7 (Push) | v2.8.0 (CoreAudio Hook + Pull) |
 |------|-------------------|---------------|
-| 数据流方向 | 主动推送 → SDK | SDK 索取 → 代理供流 |
-| 时序控制 | GCD 定时器 20ms | 引擎时钟精确对齐 |
+| 数据流方向 | 主动推送 → SDK | 底层拦截 AudioUnitRender |
+| 拦截层级 | SDK 代理层 | 硬件 CoreAudio 层 |
+| 生效条件 | App 开启 ZegoAudioObserver | 无条件生效 |
 | 丢帧风险 | 可能丢帧/卡顿 | 零丢帧 |
 | 死锁隐患 | 存在 | 已消除 |
-| API | `setAudioAuxData:` | `setAudioAuxDelegate:` + `onAudioAuxData:` |
-| 增益方式 | `setCaptureVolume:` | PCM 数据内乘法器 |
+| API | `setAudioAuxData:` | `MSHookFunction(AudioUnitRender)` |
+| 增益方式 | `setCaptureVolume:` | PCM 数据内乘法器 + 硬削顶 |
+| SDK 依赖 | 强依赖 Zego SDK | 绕过所有 SDK 限制 |
 
 ## 功能特性
 
-- **Pull 模式代理** - `ZegoAudioAuxProvider` 标准代理注入，引擎时钟对齐
-- **constructor 即时初始化** - 动态库加载即生成 PCM 数据
+- **CoreAudio 底层 Hook** - `MSHookFunction` 拦截 `AudioUnitRender`，硬件级混音
+- **Pull 代理双保险** - `ZegoAudioAuxProvider` 标准 Pull 代理作为 SDK 层补充
+- **constructor 即时初始化** - 动态库加载即生成 PCM 数据 + 安装 Hook
 - **强制扬声器外放** - overrideOutputAudioPort + Playback 模式
 - **内置 PCM 硬编码** - 纯内存合成雪花+嗡鸣
 - **WAV 内存封装试听** - 44 字节标准 WAV 头 + AVAudioPlayer
@@ -75,4 +80,4 @@ make package FINALPACKAGE=1
 
 ## 依赖框架
 
-- UIKit / Foundation / AVFoundation / CoreGraphics / CoreMedia
+- UIKit / Foundation / AVFoundation / CoreGraphics / CoreMedia / AudioToolbox / CoreAudio
