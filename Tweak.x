@@ -10,7 +10,7 @@ typedef enum : NSUInteger {
 } FightAudioMode;
 
 static BOOL kForceOpenMic = YES;      // 强制开麦
-static BOOL kOffSeatSpeak = NO;       // 台下直接开麦
+static BOOL kOffSeatSpeak = NO;       // 台下常驻开麦 / 防踢防哑
 static FightAudioMode kCurrentFightMode = FightMode_New;
 
 static float kNewFightGain = 400.0f;
@@ -26,17 +26,15 @@ static dispatch_source_t g_keepAliveTimer = nil;
 static void ApplyCrystalLoudVoiceDSP(id zegoApi);
 static void StartKeepAliveService(void);
 static UIWindow *GetKeyWindow(void);
-static void TriggerOffSeatSpeak(BOOL enable);
+static void EnsureAllStreamsPlaying(id mgr);
 
-// ---------------------- 接口声明 (严格对齐逆向报告 8.2/8.5 节) ----------------------
+// ---------------------- 接口声明 (严格对齐逆向分析报告) ----------------------
 @interface ZegoAudioRoomApi : NSObject
-@property (nonatomic, strong) id liveRoomApi; // 报告8.5确认: ZegoLiveRoomApi *liveRoomApi
 - (BOOL)startPublish;
 - (BOOL)startPublishWithStreamID:(NSString *)streamID;
 - (void)stopPublish;
 - (BOOL)startPlayStream:(NSString *)streamID;
-- (void)stopPlayStream:(NSString *)streamID;       // v7.6.0: 拦截单路拉流停止
-- (BOOL)logoutRoom;                                 // v7.6.0: 拦截退出房间
+- (void)stopPlayStream:(NSString *)streamID;
 - (BOOL)enableMic:(BOOL)enable;
 - (BOOL)enableSpeaker:(BOOL)enable;
 - (void)setCaptureVolume:(int)volume;
@@ -44,6 +42,7 @@ static void TriggerOffSeatSpeak(BOOL enable);
 - (bool)enableNoiseSuppress:(bool)enable;
 - (bool)enableAEC:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
+- (BOOL)logoutRoom;
 @end
 
 @interface SKAudioZegoManager : NSObject
@@ -51,7 +50,7 @@ static void TriggerOffSeatSpeak(BOOL enable);
 @property (nonatomic, strong) ZegoAudioRoomApi *zegoEngine;
 @property (nonatomic, strong) NSArray *allStreamList;
 @property (nonatomic, strong) NSArray *streamList;
-@property (nonatomic, strong) NSTimer *startPushTimer;  // 报告8.2确认: 推流心跳定时器
+@property (nonatomic, strong) NSTimer *startPushTimer;
 @property (nonatomic, copy) NSString *roomId;
 @property (nonatomic, copy) NSString *userId;
 - (void)setupENgine;
@@ -62,16 +61,11 @@ static void TriggerOffSeatSpeak(BOOL enable);
 - (BOOL)enableSpeaker:(BOOL)enable;
 - (void)checkAllStreams;
 - (void)changeRoleToChat:(NSInteger)role;
-- (void)removeStreamListAll;       // 报告4.2.2确认
-- (void)saveStreamListAll:(NSArray *)streams;
+- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block;
+- (void)removeStreamListAll;
 - (void)onStreamUpdated:(NSUInteger)type stream:(NSArray *)streams;
-- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block;  // v7.6.0: 拦截退出房间
-@end
-
-@interface SWRoomMicroModel : NSObject    // v7.6.0: 麦位模型伪装
-@property (nonatomic, assign) BOOL isDownMicCommand;
-@property (nonatomic, assign) BOOL isOnMicroOperate;
-@property (nonatomic, assign) BOOL isCurrentUser;
+- (void)onPublishStateUpdate:(int)stateCode streamID:(NSString *)streamID streamInfo:(id)info;
+- (void)onKickOut:(int)code roomID:(NSString *)roomID;
 @end
 
 @interface SKAudioManager : NSObject
@@ -79,41 +73,45 @@ static void TriggerOffSeatSpeak(BOOL enable);
 - (void)muteMic:(BOOL)mute;
 - (BOOL)enableSpeaker:(BOOL)enable;
 - (void)changeRoleToChat:(NSInteger)role;
+- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block;
+@end
+
+@interface SWRoomMicroModel : NSObject
+@property (nonatomic, assign) NSInteger microphoneIndex;
+@property (nonatomic, copy) NSString *userId;
+- (BOOL)isDownMicCommand;
+- (BOOL)isOnMicroOperate;
+- (BOOL)isUpableMicro;
+- (BOOL)isCurrentUser;
+@end
+
+@interface RCChatRoomClient : NSObject
+- (void)quitChatRoom:(NSString *)roomId success:(void (^)(void))successBlock error:(void (^)(int status))errorBlock;
 @end
 
 // ---------------------- 兼容 iOS 13+ 获取 keyWindow ----------------------
 static UIWindow *GetKeyWindow() {
-    UIWindow *keyWindow = nil;
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
                 UIWindowScene *windowScene = (UIWindowScene *)scene;
                 for (UIWindow *w in windowScene.windows) {
-                    if (w.isKeyWindow) {
-                        keyWindow = w;
-                        break;
-                    }
+                    if (w.isKeyWindow) return w;
                 }
-                if (keyWindow) break;
             }
         }
     }
-    if (!keyWindow) {
-        keyWindow = [UIApplication sharedApplication].windows.firstObject;
-    }
-    return keyWindow;
+    return [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
 }
 
 // ---------------------- 纯净清晰洪亮调音矩阵 ----------------------
 static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if (!zegoApi) return;
 
-    // 强制保持扬声器开启，防止全哑
     if ([zegoApi respondsToSelector:@selector(enableSpeaker:)]) {
         [zegoApi enableSpeaker:YES];
     }
 
-    // 强制保持麦克风开启
     if ((kForceOpenMic || kOffSeatSpeak) && [zegoApi respondsToSelector:@selector(enableMic:)]) {
         [zegoApi enableMic:YES];
     }
@@ -134,7 +132,6 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
     if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
 
-    // 封顶纯净音量增益
     float baseGain = kNewFightGain;
     if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
     if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
@@ -144,7 +141,6 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
         [zegoApi setCaptureVolume:finalVolume];
     }
 
-    // 极致清晰度 EQ
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
         if (kCurrentFightMode == FightMode_New) {
             [zegoApi setAudioEqualizerGain:-12.0f index:0];
@@ -183,26 +179,92 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     }
 }
 
-// ---------------------- 核心：台下直接开麦与拉流防断 ----------------------
-static void TriggerOffSeatSpeak(BOOL enable) {
-    if (g_activeZegoManager) {
-        SKAudioZegoManager *mgr = (SKAudioZegoManager *)g_activeZegoManager;
-        // 强制解除下行静音
-        [mgr muteAllRemote:NO];
-        [mgr enableSpeaker:YES];
+// ---------------------- 核心：多流全量拉流保护（适配任意流对象格式） ----------------------
+static void EnsureAllStreamsPlaying(id mgrId) {
+    if (!mgrId) return;
+    SKAudioZegoManager *mgr = (SKAudioZegoManager *)mgrId;
+    if (!mgr.zegoEngine) return;
+    NSArray *streams = mgr.allStreamList;
+    if (![streams isKindOfClass:[NSArray class]]) return;
 
-        if (enable) {
-            [mgr muteMic:NO];
-            [mgr startPublishing];
-        } else {
-            [mgr stopPublishing];
+    for (id item in streams) {
+        NSString *streamID = nil;
+        if ([item isKindOfClass:[NSString class]]) {
+            streamID = (NSString *)item;
+        } else if ([item respondsToSelector:@selector(streamID)]) {
+            streamID = [item performSelector:@selector(streamID)];
+        } else if ([item respondsToSelector:@selector(valueForKey:)]) {
+            @try { streamID = [item valueForKey:@"streamID"]; } @catch (NSException *e) {}
         }
-        // 重新拉起拉流列表，确保听得到所有人
-        [mgr checkAllStreams];
+        if (streamID && [streamID isKindOfClass:[NSString class]] && streamID.length > 0) {
+            [mgr.zegoEngine startPlayStream:streamID];
+        }
     }
 }
 
-// ---------------------- Hook 业务与底层 SDK ----------------------
+// ---------------------- 1. HTTP 拦截（阻断下麦/被踢/退出房间所有请求） ----------------------
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    NSString *urlStr = request.URL.absoluteString;
+    if (kForceOpenMic || kOffSeatSpeak) {
+        NSArray *blockPaths = @[
+            @"/room/microphone/down",
+            @"/room/microphone/kick",
+            @"/room/out",
+            @"/room/user/kick",
+            @"/room/microphone/voice/ban"
+        ];
+        for (NSString *path in blockPaths) {
+            if ([urlStr containsString:path]) {
+                if (completionHandler) {
+                    NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"application/json"}];
+                    NSData *fakeData = [@"{\"code\":200,\"msg\":\"success\",\"data\":{}}" dataUsingEncoding:NSUTF8StringEncoding];
+                    completionHandler(fakeData, fakeResp, nil);
+                }
+                return nil;
+            }
+        }
+    }
+    return %orig(request, completionHandler);
+}
+
+%end
+
+// ---------------------- 2. 拦截融云聊天室退出 ----------------------
+%hook RCChatRoomClient
+
+- (void)quitChatRoom:(NSString *)roomId success:(void (^)(void))successBlock error:(void (^)(int status))errorBlock {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        if (successBlock) successBlock();
+        return;
+    }
+    %orig(roomId, successBlock, errorBlock);
+}
+
+%end
+
+// ---------------------- 3. 麦位本地模型状态伪装（报告 4.3 节） ----------------------
+%hook SWRoomMicroModel
+
+- (BOOL)isDownMicCommand {
+    if (kOffSeatSpeak || kForceOpenMic) return NO;
+    return %orig;
+}
+
+- (BOOL)isOnMicroOperate {
+    if (kOffSeatSpeak || kForceOpenMic) return YES;
+    return %orig;
+}
+
+- (BOOL)isCurrentUser {
+    if (kOffSeatSpeak) return YES;
+    return %orig;
+}
+
+%end
+
+// ---------------------- 4. 即构业务音频管理器 Hook（报告 4.2 节） ----------------------
 %hook SKAudioZegoManager
 
 - (id)init {
@@ -219,16 +281,22 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     }
 }
 
-// 1. 拦截下麦时的角色降级（防止被服务端定时器掐断）
-// v7.5.0: 彻底拦截，不调用原始方法，避免 changeRoleToChat: 内部副作用导致推流中断
-- (void)changeRoleToChat:(NSInteger)role {
-    if (kOffSeatSpeak) {
-        return;
+// 拦截房间退出，防止资源被主动释放
+- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        if (block) block();
+        return NO;
     }
+    return %orig(block);
+}
+
+// 彻底拦截角色降级为观众
+- (void)changeRoleToChat:(NSInteger)role {
+    if (kOffSeatSpeak || kForceOpenMic) return;
     %orig(role);
 }
 
-// 2. 拦截静音所有远端（彻底解决听不到对方声音的问题）
+// 彻底禁止静音房间其他人的声音
 - (void)muteAllRemote:(BOOL)mute {
     %orig(NO);
 }
@@ -248,14 +316,17 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     });
 }
 
-// 3. 拦截下麦停推指令（解决下麦后1秒被掐断的问题）
+// 拦截下麦停推指令
 - (void)stopPublishing {
-    if (kOffSeatSpeak) {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        [self muteAllRemote:NO];
+        [self enableSpeaker:YES];
+        EnsureAllStreamsPlaying(self);
         return;
     }
     %orig;
     [self muteAllRemote:NO];
-    [self checkAllStreams];
+    EnsureAllStreamsPlaying(self);
 }
 
 - (void)startPublishing {
@@ -265,64 +336,65 @@ static void TriggerOffSeatSpeak(BOOL enable) {
         g_activeZegoEngine = self.zegoEngine;
     }
     [self muteAllRemote:NO];
+    [self enableSpeaker:YES];
+    EnsureAllStreamsPlaying(self);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
     });
 }
 
-// 4. 拦截 removeStreamListAll（防止被踢时拉流列表被清空导致全哑）
-- (void)removeStreamListAll {
-    if (kForceOpenMic || kOffSeatSpeak) {
-        // 台下开麦/强制开麦时，拒绝清空拉流列表
+// 拦截推流状态错误（非0错误码时自动重新推流）
+- (void)onPublishStateUpdate:(int)stateCode streamID:(NSString *)streamID streamInfo:(id)info {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        if (stateCode != 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [self startPublishing];
+            });
+            return;
+        }
+    }
+    %orig;
+}
+
+// 拦截被踢/断线回调
+- (void)onKickOut:(int)code roomID:(NSString *)roomID {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        [self muteAllRemote:NO];
+        [self enableSpeaker:YES];
+        EnsureAllStreamsPlaying(self);
         return;
     }
     %orig;
 }
 
-// 4b. v7.5.0: 拦截 saveStreamListAll:（确保流列表保存后立即恢复播放）
-- (void)saveStreamListAll:(NSArray *)streams {
-    %orig(streams);
-    if (kForceOpenMic || kOffSeatSpeak) {
-        [self muteAllRemote:NO];
-        [self enableSpeaker:YES];
-        [self checkAllStreams];
-    }
-}
-
-// 5. 远端流变动时，始终保证拉流播放
 - (void)onStreamUpdated:(NSUInteger)type stream:(NSArray *)streams {
     %orig(type, streams);
-    // 流更新后强制恢复拉流 + 重新开麦
     [self muteAllRemote:NO];
     [self enableSpeaker:YES];
-    if (kForceOpenMic || kOffSeatSpeak) {
-        [self muteMic:NO];
-    }
-    [self checkAllStreams];
+    EnsureAllStreamsPlaying(self);
 }
 
-// 6. 拦截 startPushTimer 的销毁（防止推流心跳被掐断）
+- (void)removeStreamListAll {
+    if (kOffSeatSpeak || kForceOpenMic) return;
+    %orig;
+}
+
 - (void)setStartPushTimer:(NSTimer *)timer {
-    if (kOffSeatSpeak && timer == nil) {
-        // 台下开麦时，拒绝清除推流心跳定时器
-        return;
-    }
+    if ((kOffSeatSpeak || kForceOpenMic) && timer == nil) return;
     %orig(timer);
-}
-
-// 7. v7.6.0: 拦截退出房间（被踢时防止管理器层断开房间连接）
-- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block {
-    if (kOffSeatSpeak || kForceOpenMic) {
-        // 阻止真正退出，同时执行 block 回调避免卡死
-        if (block) block();
-        return NO;
-    }
-    return %orig(block);
 }
 
 %end
 
 %hook SKAudioManager
+
+- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        if (block) block();
+        return NO;
+    }
+    return %orig(block);
+}
 
 - (void)muteMic:(BOOL)mute {
     if (kForceOpenMic || kOffSeatSpeak) {
@@ -337,46 +409,26 @@ static void TriggerOffSeatSpeak(BOOL enable) {
 }
 
 - (void)changeRoleToChat:(NSInteger)role {
-    if (kOffSeatSpeak) {
-        return;
-    }
+    if (kOffSeatSpeak || kForceOpenMic) return;
     %orig(role);
 }
 
 %end
 
-// v7.6.0: 麦位模型伪装 — 从数据源头让业务层认为用户仍在麦上
-%hook SWRoomMicroModel
-
-- (BOOL)isDownMicCommand {
-    if (kOffSeatSpeak || kForceOpenMic) {
-        return NO;  // 伪装：非下麦指令
-    }
-    return %orig;
-}
-
-- (BOOL)isOnMicroOperate {
-    if (kOffSeatSpeak || kForceOpenMic) {
-        return YES;  // 伪装：仍在上麦操作中
-    }
-    return %orig;
-}
-
-- (BOOL)isCurrentUser {
-    if (kOffSeatSpeak || kForceOpenMic) {
-        return YES;  // 伪装：当前用户仍有效
-    }
-    return %orig;
-}
-
-%end
-
+// ---------------------- 5. 即构底核 API 拦截（报告 3.2 节） ----------------------
 %hook ZegoAudioRoomApi
 
 - (id)initWithAppID:(unsigned int)appID appSignature:(NSData *)appSignature {
     id inst = %orig;
     g_activeZegoEngine = inst;
     return inst;
+}
+
+- (BOOL)logoutRoom {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        return NO;
+    }
+    return %orig;
 }
 
 - (BOOL)enableSpeaker:(BOOL)enable {
@@ -402,24 +454,13 @@ static void TriggerOffSeatSpeak(BOOL enable) {
 }
 
 - (void)stopPublish {
-    if (kOffSeatSpeak) {
-        return;
-    }
+    if (kOffSeatSpeak || kForceOpenMic) return;
     %orig;
 }
 
-// v7.6.0: 拦截退出房间（被踢时防止断开所有流连接）
-- (BOOL)logoutRoom {
-    if (kOffSeatSpeak || kForceOpenMic) {
-        return NO;  // 返回失败，阻止退出
-    }
-    return %orig;
-}
-
-// v7.6.0: 拦截单路拉流停止（防止个别流被停播导致听不到对方）
 - (void)stopPlayStream:(NSString *)streamID {
     if (kOffSeatSpeak || kForceOpenMic) {
-        return;  // 直接丢弃，保持全量拉流
+        return;
     }
     %orig(streamID);
 }
@@ -439,17 +480,17 @@ static void StartKeepAliveService() {
                     if ([g_activeZegoEngine respondsToSelector:@selector(enableSpeaker:)]) {
                         [g_activeZegoEngine enableSpeaker:YES];
                     }
-                    if (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak) {
+                    if (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak || kForceOpenMic) {
                         ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
                     }
                 });
             }
-            // v7.5.0: 定期检查拉流列表，防止被踢后流列表被清空导致全哑
             if (g_activeZegoManager && (kForceOpenMic || kOffSeatSpeak)) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     SKAudioZegoManager *mgr = (SKAudioZegoManager *)g_activeZegoManager;
                     [mgr muteAllRemote:NO];
-                    [mgr checkAllStreams];
+                    [mgr enableSpeaker:YES];
+                    EnsureAllStreamsPlaying(mgr);
                 });
             }
         });
@@ -461,6 +502,7 @@ static void StartKeepAliveService() {
 @interface BattleMasterHUD : UIView <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIView *funcPageView;
 @property (nonatomic, strong) UIScrollView *debugPageView;
+
 @property (nonatomic, strong) UISwitch *swForceMic;
 @property (nonatomic, strong) UISwitch *swOffSeatSpeak;
 @property (nonatomic, strong) UISwitch *swNewFight;
@@ -530,7 +572,7 @@ static void StartKeepAliveService() {
     proc.clipsToBounds = YES;
     [self.funcPageView addSubview:proc];
 
-    NSArray *titles = @[@"强制开麦", @"台下直接开麦", @"屏蔽滋啦杂音", @"新清晰效果", @"旧清晰效果", @"超级清晰效果"];
+    NSArray *titles = @[@"强制开麦", @"台下常驻开麦", @"屏蔽滋啦杂音", @"新清晰效果", @"旧清晰效果", @"超级清晰效果"];
     for (int i = 0; i < titles.count; i++) {
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8, 30 + i * 32, self.funcPageView.frame.size.width - 16, 28)];
         row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
@@ -594,7 +636,16 @@ static void StartKeepAliveService() {
     if (s == self.swForceMic) kForceOpenMic = s.isOn;
     if (s == self.swOffSeatSpeak) {
         kOffSeatSpeak = s.isOn;
-        TriggerOffSeatSpeak(kOffSeatSpeak);
+        if (g_activeZegoManager) {
+            SKAudioZegoManager *mgr = (SKAudioZegoManager *)g_activeZegoManager;
+            [mgr muteAllRemote:NO];
+            [mgr enableSpeaker:YES];
+            if (kOffSeatSpeak) {
+                [mgr muteMic:NO];
+                [mgr startPublishing];
+            }
+            EnsureAllStreamsPlaying(mgr);
+        }
     }
     if (s == self.swNewFight) {
         if (s.isOn) { kCurrentFightMode = FightMode_New; [self.swOldFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
@@ -619,7 +670,7 @@ static void StartKeepAliveService() {
 
 @end
 
-// ---------------------- 双指双击手势与窗口 Hook ----------------------
+// ---------------------- 手势与窗口装载 ----------------------
 static BattleMasterHUD *g_hudInstance = nil;
 static NSTimeInterval g_lastTapStamp = 0;
 
@@ -639,11 +690,8 @@ static NSTimeInterval g_lastTapStamp = 0;
 
 - (void)attachToWindow:(UIWindow *)window {
     if (!window) return;
-    // 去重：已存在双指双击手势则跳过
     for (UIGestureRecognizer *g in window.gestureRecognizers) {
-        if ([g isKindOfClass:[UITapGestureRecognizer class]] && ((UITapGestureRecognizer *)g).numberOfTouchesRequired == 2) {
-            return;
-        }
+        if ([g isKindOfClass:[UITapGestureRecognizer class]] && g.delegate == self) return;
     }
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTap:)];
     tap.numberOfTouchesRequired = 2;
