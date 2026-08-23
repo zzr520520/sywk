@@ -4,6 +4,9 @@
 #import <CoreMedia/CoreMedia.h>
 #import <math.h>
 #import <stdlib.h>
+#import <pthread.h>
+
+#define kDefaultNoiseFile @"/Library/Application Support/com.battlemaster/tv_snow.mp3"
 
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
@@ -16,7 +19,6 @@ static BOOL kForceOpenMic = YES;
 static BOOL kSmartNoiseFilter = NO;
 static FightAudioMode kCurrentFightMode = FightMode_New;
 
-// 音量控制
 static float kNewFightGain = 500.0f;
 static float kOldFightGain = 1000.0f;
 static float kSuperFightGain = 1500.0f;
@@ -28,14 +30,14 @@ static __weak id g_activeZegoApi = nil;
 static dispatch_source_t g_keepAliveTimer = nil;
 static dispatch_source_t g_auxPushTimer = nil;
 
-// MP3 内存池
+// 线程安全互斥锁与 PCM 内存池
+static pthread_mutex_t g_pcmMutex = PTHREAD_MUTEX_INITIALIZER;
 static int16_t *g_musicPcmBuffer = NULL;
 static size_t g_musicPcmSize = 0;
 static size_t g_musicPcmOffset = 0;
 
-// 老式电视无信号物理相位
 static double g_hum50HzPhase = 0.0;
-static double g_tvHScanPhase = 0.0; // 15625Hz 电视行频
+static double g_tvHScanPhase = 0.0;
 static double g_pulsePhase = 0.0;
 
 @interface NSObject (ZegoSDKDeclarations)
@@ -47,10 +49,15 @@ static double g_pulsePhase = 0.0;
 - (bool)enableAEC:(bool)enable;
 - (bool)enableMic:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
-// ZegoAudioAux 辅助混音通道接口
 - (void)enableAux:(bool)enable;
 - (bool)setAudioAuxData:(const void *)data dataLen:(int)dataLen sampleRate:(int)sampleRate channelCount:(int)channelCount;
 @end
+
+// ---------------------- 前置函数声明 ----------------------
+static void LoadMP3ToPCM(NSString *filePath);
+static void ApplyPreciseRadioFightDSP(id zegoApi);
+static void StartAuxDataInjector(void);
+static void StartKeepAliveService(void);
 
 // ---------------------- 路径辅助 ----------------------
 static NSString *GetSafeDir(NSString *subDir) {
@@ -85,24 +92,20 @@ static UIWindow *GetKeyWindow() {
     return keyWindow;
 }
 
-// ---------------------- 电视无信号雪花音核心生成器 ----------------------
+// ---------------------- 电视无信号雪花合成 ----------------------
 static inline int16_t GenerateTVSnowSample(float noiseLevelDB, float humLevelDB) {
-    // 1. 产生纯正老式电视高斯雪花白噪声 (全频随机脉冲)
     float whiteNoise = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f);
     float noiseAmp = 32767.0f * powf(10.0f, noiseLevelDB / 20.0f);
 
-    // 2. 50Hz 电视场频交流电嗡鸣 (粗糙工频声)
     g_hum50HzPhase += 50.0 / 44100.0;
     if (g_hum50HzPhase >= 1.0) g_hum50HzPhase -= 1.0;
     float humAmp = 32767.0f * powf(10.0f, humLevelDB / 20.0f);
     float hum = sinf(g_hum50HzPhase * 2.0 * M_PI) * humAmp;
 
-    // 3. 15.625kHz 显像管高频啸叫载波
     g_tvHScanPhase += 15625.0 / 44100.0;
     if (g_tvHScanPhase >= 1.0) g_tvHScanPhase -= 1.0;
     float hScan = sinf(g_tvHScanPhase * 2.0 * M_PI) * (noiseAmp * 0.15f);
 
-    // 4. 20Hz 电视画面跳帧切音撕拉调制
     g_pulsePhase += 20.0 / 44100.0;
     if (g_pulsePhase >= 1.0) g_pulsePhase -= 1.0;
     float tearMod = (sinf(g_pulsePhase * 2.0 * M_PI) > -0.2) ? 1.0f : 0.3f;
@@ -113,205 +116,8 @@ static inline int16_t GenerateTVSnowSample(float noiseLevelDB, float humLevelDB)
     return (int16_t)result;
 }
 
-// ---------------------- Aux 持续灌流推流线程 (解决推不上去问题) ----------------------
-static void StartAuxDataInjector() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
-        g_auxPushTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
-        // 每 20ms 发送一帧 (44100Hz 下 20ms = 882 samples)
-        dispatch_source_set_timer(g_auxPushTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(20 * NSEC_PER_MSEC), 0);
-        dispatch_source_set_event_handler(g_auxPushTimer, ^{
-            if (!g_activeZegoApi || kCurrentFightMode == FightMode_Normal) return;
-
-            int sampleCount = 882;
-            int16_t frameBuffer[882];
-
-            float noiseDB = -18.0f;
-            float humDB = -15.0f;
-            if (kCurrentFightMode == FightMode_Old) { noiseDB = -15.0f; humDB = -13.0f; }
-            if (kCurrentFightMode == FightMode_Super) { noiseDB = -12.0f; humDB = -11.0f; }
-
-            for (int i = 0; i < sampleCount; i++) {
-                int16_t snow = GenerateTVSnowSample(noiseDB, humDB);
-                if (g_musicPcmBuffer && g_musicPcmSize > 0) {
-                    int16_t music = g_musicPcmBuffer[g_musicPcmOffset++];
-                    if (g_musicPcmOffset >= g_musicPcmSize) g_musicPcmOffset = 0;
-                    snow = (int16_t)((snow + music) / 2);
-                }
-                frameBuffer[i] = snow;
-            }
-
-            // 直接通过 SDK 核心 ZegoAudioAux 通道持续注入上行混音流
-            id zegoApi = g_activeZegoApi;
-            if (zegoApi && [zegoApi respondsToSelector:@selector(setAudioAuxData:dataLen:sampleRate:channelCount:)]) {
-                [zegoApi setAudioAuxData:frameBuffer dataLen:sampleCount * (int)sizeof(int16_t) sampleRate:44100 channelCount:1];
-            }
-        });
-        dispatch_resume(g_auxPushTimer);
-    });
-}
-
-// ---------------------- 核心调音与 3A 锁定 ----------------------
-static void ApplyPreciseRadioFightDSP(id zegoApi) {
-    if (!zegoApi) return;
-
-    if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) {
-        [zegoApi enableMic:YES];
-    }
-
-    if (kCurrentFightMode == FightMode_Normal) {
-        if ([zegoApi respondsToSelector:@selector(enableAux:)]) [zegoApi enableAux:NO];
-        if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
-        if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
-        if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
-        if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
-        if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-            for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
-        }
-        return;
-    }
-
-    // 开启 Aux 混音通道
-    if ([zegoApi respondsToSelector:@selector(enableAux:)]) {
-        [zegoApi enableAux:YES];
-    }
-
-    // 强制关闭 3A，防止雪花白噪与 50Hz 嗡鸣被消除
-    if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
-    if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
-    if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
-    if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
-
-    // 设置指定麦克风增益
-    float baseGain = kNewFightGain;
-    if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
-    if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-    int finalVolume = (int)(baseGain * kVoiceGainRatio);
-
-    if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) {
-        [zegoApi setCaptureVolume:finalVolume];
-    }
-
-    // 20Hz-20kHz 全频保留，不切低频嗡鸣，强化咬字齿音
-    if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-        [zegoApi setAudioEqualizerGain:6.0f index:0];  // 31Hz
-        [zegoApi setAudioEqualizerGain:8.0f index:1];  // 62Hz 50Hz嗡鸣区
-        [zegoApi setAudioEqualizerGain:4.0f index:2];  // 125Hz
-        [zegoApi setAudioEqualizerGain:0.0f index:3];  // 250Hz 直通
-        [zegoApi setAudioEqualizerGain:0.0f index:4];  // 500Hz 直通
-        [zegoApi setAudioEqualizerGain:6.0f index:5];  // 1kHz
-        [zegoApi setAudioEqualizerGain:10.0f index:6]; // 2kHz
-        [zegoApi setAudioEqualizerGain:12.0f index:7]; // 4kHz 齿音穿透
-        [zegoApi setAudioEqualizerGain:8.0f index:8];  // 8kHz
-        [zegoApi setAudioEqualizerGain:6.0f index:9];  // 16kHz
-    }
-}
-
-// ---------------------- Hook 业务与底层 ----------------------
-%hook SKAudioZegoManager
-
-- (void)enableMic:(BOOL)enable {
-    if (kForceOpenMic) {
-        %orig(YES);
-    } else {
-        %orig(enable);
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(g_activeZegoApi);
-    });
-}
-
-- (BOOL)micEnabled {
-    if (kForceOpenMic) return YES;
-    return %orig;
-}
-
-%end
-
-%hook SKMicrophonePermissionManager
-
-+ (BOOL)hasMicrophonePermission {
-    if (kForceOpenMic) return YES;
-    return %orig;
-}
-
-%end
-
-%hook ZegoLiveRoomApi
-
-- (id)init {
-    id inst = %orig;
-    g_activeZegoApi = inst;
-    StartAuxDataInjector();
-    return inst;
-}
-
-- (bool)enableMic:(bool)enable {
-    g_activeZegoApi = self;
-    if (kForceOpenMic) return %orig(YES);
-    return %orig(enable);
-}
-
-- (bool)setCaptureVolume:(int)volume {
-    g_activeZegoApi = self;
-    if (kCurrentFightMode != FightMode_Normal) {
-        float baseGain = kNewFightGain;
-        if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
-        if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-        return %orig((int)(baseGain * kVoiceGainRatio));
-    }
-    return %orig(volume);
-}
-
-- (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo {
-    g_activeZegoApi = self;
-    bool res = %orig;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(weakSelf);
-    });
-    return res;
-}
-
-- (bool)startPublishing2:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo params:(NSString *)params channelIndex:(int)channelIndex {
-    g_activeZegoApi = self;
-    bool res = %orig;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(weakSelf);
-    });
-    return res;
-}
-
-%end
-
-// ---------------------- 保活线程 ----------------------
-static void StartKeepAliveService() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
-        g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-        dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
-        dispatch_source_set_event_handler(g_keepAliveTimer, ^{
-            if (g_activeZegoApi && kCurrentFightMode != FightMode_Normal) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    ApplyPreciseRadioFightDSP(g_activeZegoApi);
-                });
-            }
-        });
-        dispatch_resume(g_keepAliveTimer);
-    });
-}
-
-// ---------------------- MP3 解码模块 ----------------------
+// ---------------------- 线程安全 MP3 解码 ----------------------
 static void LoadMP3ToPCM(NSString *filePath) {
-    if (g_musicPcmBuffer) {
-        free(g_musicPcmBuffer);
-        g_musicPcmBuffer = NULL;
-        g_musicPcmSize = 0;
-        g_musicPcmOffset = 0;
-    }
     if (!filePath || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) return;
 
     NSURL *url = [NSURL fileURLWithPath:filePath];
@@ -357,14 +163,218 @@ static void LoadMP3ToPCM(NSString *filePath) {
         }
     }
 
+    // 锁外 malloc + memcpy (耗时操作不阻塞音频推流线程)
     if (pcmData.length > 0) {
-        g_musicPcmSize = pcmData.length / sizeof(int16_t);
-        g_musicPcmBuffer = (int16_t *)malloc(pcmData.length);
-        if (g_musicPcmBuffer) {
-            memcpy(g_musicPcmBuffer, pcmData.bytes, pcmData.length);
-            g_musicPcmOffset = 0;
+        size_t newSize = pcmData.length / sizeof(int16_t);
+        int16_t *newBuf = (int16_t *)malloc(pcmData.length);
+        if (!newBuf) return;
+        memcpy(newBuf, pcmData.bytes, pcmData.length);
+
+        // 锁内仅做原子指针置换 (极短临界区)
+        int16_t *oldBufToFree = NULL;
+        pthread_mutex_lock(&g_pcmMutex);
+        oldBufToFree = g_musicPcmBuffer;
+        g_musicPcmBuffer = newBuf;
+        g_musicPcmSize = newSize;
+        g_musicPcmOffset = 0;
+        pthread_mutex_unlock(&g_pcmMutex);
+
+        // 锁外释放旧缓冲区 (避免 free 阻塞音频线程)
+        if (oldBufToFree) {
+            free(oldBufToFree);
         }
     }
+}
+
+// ---------------------- Aux 持续灌流 ----------------------
+static void StartAuxDataInjector() {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        LoadMP3ToPCM(kDefaultNoiseFile);
+
+        dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+        g_auxPushTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        dispatch_source_set_timer(g_auxPushTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(20 * NSEC_PER_MSEC), 0);
+        dispatch_source_set_event_handler(g_auxPushTimer, ^{
+            if (!g_activeZegoApi || kCurrentFightMode == FightMode_Normal) return;
+
+            int sampleCount = 882;
+            int16_t frameBuffer[882];
+
+            float noiseDB = -18.0f;
+            float humDB = -15.0f;
+            if (kCurrentFightMode == FightMode_Old) { noiseDB = -15.0f; humDB = -13.0f; }
+            if (kCurrentFightMode == FightMode_Super) { noiseDB = -12.0f; humDB = -11.0f; }
+
+            pthread_mutex_lock(&g_pcmMutex);
+            if (g_musicPcmBuffer && g_musicPcmSize > 0) {
+                for (int i = 0; i < sampleCount; i++) {
+                    frameBuffer[i] = g_musicPcmBuffer[g_musicPcmOffset++];
+                    if (g_musicPcmOffset >= g_musicPcmSize) g_musicPcmOffset = 0;
+                }
+            } else {
+                for (int i = 0; i < sampleCount; i++) {
+                    frameBuffer[i] = GenerateTVSnowSample(noiseDB, humDB);
+                }
+            }
+            pthread_mutex_unlock(&g_pcmMutex);
+
+            id zegoApi = g_activeZegoApi;
+            if (zegoApi && [zegoApi respondsToSelector:@selector(setAudioAuxData:dataLen:sampleRate:channelCount:)]) {
+                [zegoApi setAudioAuxData:frameBuffer dataLen:sampleCount * (int)sizeof(int16_t) sampleRate:44100 channelCount:1];
+            }
+        });
+        dispatch_resume(g_auxPushTimer);
+    });
+}
+
+// ---------------------- 核心调音与 3A 锁定 ----------------------
+static void ApplyPreciseRadioFightDSP(id zegoApi) {
+    if (!zegoApi) return;
+
+    if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) {
+        [zegoApi enableMic:YES];
+    }
+
+    if (kCurrentFightMode == FightMode_Normal) {
+        if ([zegoApi respondsToSelector:@selector(enableAux:)]) [zegoApi enableAux:NO];
+        if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
+        if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
+        if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
+        if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
+        if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
+            for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
+        }
+        return;
+    }
+
+    if ([zegoApi respondsToSelector:@selector(enableAux:)]) {
+        [zegoApi enableAux:YES];
+    }
+
+    if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
+    if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
+    if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
+    if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
+
+    float baseGain = kNewFightGain;
+    if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
+    if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
+    int finalVolume = (int)(baseGain * kVoiceGainRatio);
+
+    if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) {
+        [zegoApi setCaptureVolume:finalVolume];
+    }
+
+    if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
+        [zegoApi setAudioEqualizerGain:6.0f index:0];
+        [zegoApi setAudioEqualizerGain:8.0f index:1];
+        [zegoApi setAudioEqualizerGain:4.0f index:2];
+        [zegoApi setAudioEqualizerGain:0.0f index:3];
+        [zegoApi setAudioEqualizerGain:0.0f index:4];
+        [zegoApi setAudioEqualizerGain:6.0f index:5];
+        [zegoApi setAudioEqualizerGain:10.0f index:6];
+        [zegoApi setAudioEqualizerGain:12.0f index:7];
+        [zegoApi setAudioEqualizerGain:8.0f index:8];
+        [zegoApi setAudioEqualizerGain:6.0f index:9];
+    }
+}
+
+// ---------------------- Hook 业务与底层 ----------------------
+%hook SKAudioZegoManager
+
+- (void)enableMic:(BOOL)enable {
+    if (kForceOpenMic) {
+        %orig(YES);
+    } else {
+        %orig(enable);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyPreciseRadioFightDSP(g_activeZegoApi);
+    });
+}
+
+- (BOOL)micEnabled {
+    if (kForceOpenMic) return YES;
+    return %orig;
+}
+
+%end
+
+%hook SKMicrophonePermissionManager
+
++ (BOOL)hasMicrophonePermission {
+    if (kForceOpenMic) return YES;
+    return %orig;
+}
+
+%end
+
+%hook ZegoLiveRoomApi
+
+- (id)init {
+    id inst = %orig;
+    g_activeZegoApi = inst;
+    return inst;
+}
+
+- (bool)enableMic:(bool)enable {
+    g_activeZegoApi = self;
+    if (kForceOpenMic) return %orig(YES);
+    return %orig(enable);
+}
+
+- (bool)setCaptureVolume:(int)volume {
+    g_activeZegoApi = self;
+    if (kCurrentFightMode != FightMode_Normal) {
+        float baseGain = kNewFightGain;
+        if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
+        if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
+        return %orig((int)(baseGain * kVoiceGainRatio));
+    }
+    return %orig(volume);
+}
+
+- (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo {
+    g_activeZegoApi = self;
+    bool res = %orig;
+    StartAuxDataInjector();
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyPreciseRadioFightDSP(weakSelf);
+    });
+    return res;
+}
+
+- (bool)startPublishing2:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo params:(NSString *)params channelIndex:(int)channelIndex {
+    g_activeZegoApi = self;
+    bool res = %orig;
+    StartAuxDataInjector();
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyPreciseRadioFightDSP(weakSelf);
+    });
+    return res;
+}
+
+%end
+
+// ---------------------- 注入启动 ----------------------
+static void StartKeepAliveService() {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+        g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
+        dispatch_source_set_event_handler(g_keepAliveTimer, ^{
+            if (g_activeZegoApi && kCurrentFightMode != FightMode_Normal) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ApplyPreciseRadioFightDSP(g_activeZegoApi);
+                });
+            }
+        });
+        dispatch_resume(g_keepAliveTimer);
+    });
 }
 
 // ---------------------- 音乐管理视图 ----------------------
@@ -402,8 +412,18 @@ static void LoadMP3ToPCM(NSString *filePath) {
         [stopBtn addTarget:self action:@selector(stopPlayMusic) forControlEvents:UIControlEventTouchUpInside];
         [self addSubview:stopBtn];
 
-        self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(145, 8, frame.size.width - 150, 26)];
-        self.statusLabel.text = @"未推流音乐";
+        UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        resetBtn.frame = CGRectMake(143, 8, 55, 26);
+        [resetBtn setTitle:@"默认噪音" forState:UIControlStateNormal];
+        [resetBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        resetBtn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+        resetBtn.backgroundColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.85 alpha:1.0];
+        resetBtn.layer.cornerRadius = 6;
+        [resetBtn addTarget:self action:@selector(loadDefaultNoise) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:resetBtn];
+
+        self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(202, 8, frame.size.width - 207, 26)];
+        self.statusLabel.text = @"默认噪音";
         self.statusLabel.font = [UIFont systemFontOfSize:10];
         self.statusLabel.textColor = [UIColor colorWithRed:0.4 green:0.8 blue:1.0 alpha:1.0];
         [self addSubview:self.statusLabel];
@@ -520,13 +540,21 @@ static void LoadMP3ToPCM(NSString *filePath) {
     [self.tableView reloadData];
 }
 
+- (void)loadDefaultNoise {
+    LoadMP3ToPCM(kDefaultNoiseFile);
+    kCurrentMusicFile = nil;
+    self.statusLabel.text = @"默认噪音";
+}
+
 - (void)stopPlayMusic {
+    pthread_mutex_lock(&g_pcmMutex);
     if (g_musicPcmBuffer) {
         free(g_musicPcmBuffer);
         g_musicPcmBuffer = NULL;
         g_musicPcmSize = 0;
         g_musicPcmOffset = 0;
     }
+    pthread_mutex_unlock(&g_pcmMutex);
     kCurrentMusicFile = nil;
     self.statusLabel.text = @"已停止推流";
 }
@@ -558,7 +586,6 @@ static void LoadMP3ToPCM(NSString *filePath) {
         pan.delegate = self;
         [self addGestureRecognizer:pan];
 
-        // 左侧栏
         UIView *leftTab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 75, frame.size.height)];
         leftTab.backgroundColor = [UIColor colorWithRed:0.75 green:0.88 blue:1.0 alpha:0.96];
         [self addSubview:leftTab];
@@ -673,11 +700,15 @@ static void LoadMP3ToPCM(NSString *filePath) {
 
 - (void)setupSettingPage {
     NSArray *info = @[
-        @"FightVoicePro v2.2.0",
+        @"FightVoicePro v2.3.0",
         @"",
         @"推流通道: ZegoAudioAux",
         @"  enableAux: + setAudioAuxData:",
         @"  20ms 定时注入 (882 samples/frame)",
+        @"  推流时机: startPublishing 后激活",
+        @"",
+        @"线程安全: pthread_mutex 保护 PCM",
+        @"  切歌/默认噪音时无 Use-After-Free",
         @"",
         @"TV 雪花 DSP 参数:",
         @"  白噪声: 全频段随机脉冲",
@@ -776,7 +807,6 @@ static NSTimeInterval g_lastTapStamp = 0;
 
 - (void)attachToWindow:(UIWindow *)window {
     if (!window) return;
-    // 避免重复注册手势
     for (UIGestureRecognizer *g in window.gestureRecognizers) {
         if ([g isKindOfClass:[UITapGestureRecognizer class]] && ((UITapGestureRecognizer *)g).numberOfTouchesRequired == 2) {
             return;

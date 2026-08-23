@@ -1,6 +1,15 @@
-# FightVoicePro v2.2.0 - 声控物语搏击音效插件
+# FightVoicePro v2.3.0 - 声控物语搏击音效插件
 
 专用于声控物语的 ZegoAudioAux 推流通道与老式电视无信号雪花音效插件（Tweak）。
+
+## v2.3.0 核心修复
+
+- **pthread 线程安全 PCM 管理** - 互斥锁保护 PCM 缓冲区，彻底规避切歌时的 Use-After-Free 竞争崩溃
+- **Double-buffering 原子置换** - 锁外 malloc+memcpy 完成新缓冲区准备，锁内仅做指针原子置换，锁外释放旧缓冲区；音频推流线程阻塞时间趋近于零
+- **推流时机修正** - Aux 灌流从 `init` 移至 `startPublishing` / `startPublishing2`，确保 SDK 完全初始化后再注入数据，消除空指针崩溃
+- **前置函数声明** - `LoadMP3ToPCM` / `ApplyPreciseRadioFightDSP` / `StartAuxDataInjector` / `StartKeepAliveService` 全部前置声明，消除隐式声明编译错误
+- **合并 UIWindow Hook** - 修复 Logos 语法中重复 `%hook UIWindow` 硬伤，手势挂载与保活定时器在单一 hook 内同步拉起
+- **内置默认噪音** - 启动即加载 `tv_snow.mp3`，无需用户手动导入即可输出雪花音效
 
 ## v2.2.0 核心重构
 
@@ -13,6 +22,7 @@
 ## 功能特性
 
 - **ZegoAudioAux 推流通道** - 官方标准辅助混音 API，20ms 定时持续注入 PCM
+- **线程安全 PCM 池** - pthread_mutex + Double-buffering，切歌/停止/默认噪音切换无竞争崩溃
 - **电视雪花音效** - 全频段随机白噪声 + 50Hz 场频嗡鸣 + 15625Hz 行频啸叫 + 20Hz 跳帧撕扯
 - **多重强制开麦** - ZegoLiveRoomApi / SKAudioZegoManager / SKMicrophonePermissionManager 三层拦截
 - **强制永久关闭 3A** - AGC / ANS / Noise Gate / AEC 全部禁用
@@ -28,7 +38,7 @@
 1. 安装 `.deb` 或注入 `.dylib` 到声控物语 App
 2. 启动 App 后，**双指双击**屏幕调出悬浮面板
 3. 点击开关开启/关闭搏击音效
-4. **音乐 Tab**：点击「上麦发」解码 MP3 至 PCM 并注入推流
+4. **音乐 Tab**：点击「上麦发」解码 MP3 至 PCM 并注入推流；点击「默认噪音」恢复内置雪花
 5. **调试 Tab**：独立调节各档位音量、人声权重
 6. **设置 Tab**：查看当前 DSP 参数与版本信息
 
@@ -54,13 +64,23 @@
 | 声道 | 单声道 | Mono |
 | 保活间隔 | 0.8 s | DSP 参数刷新间隔 |
 
+## 线程安全架构
+
+| 组件 | 机制 | 说明 |
+|------|------|------|
+| PCM 缓冲区 | pthread_mutex | 互斥锁保护 g_musicPcmBuffer 读写 |
+| 新缓冲区分配 | 锁外 malloc + memcpy | 耗时操作不阻塞音频推流线程 |
+| 指针置换 | 锁内原子赋值 | 极短临界区，音频线程等待趋近零 |
+| 旧缓冲区释放 | 锁外 free | 避免 free 耗时阻塞音频线程 |
+| 停止播放 | 锁内 free + 置 NULL | 读者线程检测 NULL 自动回退至雪花合成 |
+
 ## 推流通道架构
 
 | 组件 | API | 说明 |
 |------|-----|------|
 | 辅助混音开关 | `enableAux:` | 开启 ZegoAudioAux 通道 |
 | PCM 数据注入 | `setAudioAuxData:dataLen:sampleRate:channelCount:` | 20ms 定时持续灌入 |
-| 推流拦截 | `startPublishing:title:flag:extraInfo:` | 延迟 0.3s 自动配置 |
+| 推流拦截 | `startPublishing:title:flag:extraInfo:` | 推流成功后激活 Aux 注入 |
 | 推流拦截2 | `startPublishing2:...` | 多通道推流拦截 |
 
 ## 构建
