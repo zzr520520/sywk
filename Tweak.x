@@ -14,8 +14,8 @@ typedef enum : NSUInteger {
     FightMode_Super     // 超级战斗 (极限过载 + 2500极限增益 + 绝对清晰)
 } FightAudioMode;
 
-static BOOL kForceOpenMic = YES;      // 基础强制开麦
-static BOOL kGhostMicMode = NO;       // 满位强开麦（独立控制）
+static BOOL kForceOpenMic = YES;      // 麦位防静音/强制开麦
+static BOOL kOffSeatSpeak = NO;       // 台下直接开麦（不上麦位直接推流）
 static BOOL kSmartNoiseFilter = NO;
 static FightAudioMode kCurrentFightMode = FightMode_New;
 
@@ -27,6 +27,7 @@ static float kVoiceGainRatio = 1.0f;
 
 static NSString *kCurrentMusicFile = nil;
 static NSString *g_currentRoomID = nil;
+static BOOL g_isGhostPublishing = NO;
 
 static __weak id g_activeZegoApi = nil;
 static id g_zegoMusicPlayer = nil;
@@ -54,7 +55,7 @@ static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int 
 static NSString *GetDefaultNoiseFilePath(void);
 static void TriggerZegoEffectPush(BOOL start);
 static void LoadMP3ToPCM(NSString *filePath);
-static void ProcessGhostMicPublish(id zegoApi);
+static void HandleOffSeatSpeakToggle(id zegoApi, BOOL enable);
 
 @interface NSObject (ZegoSDKDeclarations)
 - (bool)setCaptureVolume:(int)volume;
@@ -66,6 +67,7 @@ static void ProcessGhostMicPublish(id zegoApi);
 - (bool)enableMic:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
 - (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag;
+- (bool)stopPublishing;
 
 // 单通道推流播放器接口
 // 注意: stop 方法在系统框架中已有多处 - (void)stop 声明，此处不重复声明以避免歧义
@@ -234,25 +236,37 @@ static void TriggerZegoEffectPush(BOOL start) {
     }
 }
 
-// ---------------------- 满位强开麦（独立推流引擎） ----------------------
-static void ProcessGhostMicPublish(id zegoApi) {
-    if (!zegoApi || !kGhostMicMode) return;
+// ---------------------- 台下直接开麦核心推流管理 ----------------------
+static void HandleOffSeatSpeakToggle(id zegoApi, BOOL enable) {
+    if (!zegoApi) return;
 
-    @try {
-        if ([zegoApi respondsToSelector:@selector(enableMic:)]) {
-            [zegoApi enableMic:YES];
-        }
+    if (enable) {
+        @try {
+            if ([zegoApi respondsToSelector:@selector(enableMic:)]) {
+                [zegoApi enableMic:YES];
+            }
 
-        NSString *streamID = nil;
-        if (g_currentRoomID && g_currentRoomID.length > 0) {
-            NSString *uid = [[NSUserDefaults standardUserDefaults] stringForKey:@"SK_USER_ID_KEY"] ?: @"10001";
-            streamID = [NSString stringWithFormat:@"s-%@-%@", g_currentRoomID, uid];
-        }
+            if (!g_isGhostPublishing) {
+                NSString *uid = [[NSUserDefaults standardUserDefaults] stringForKey:@"SK_USER_ID_KEY"] ?: @"10001";
+                NSString *room = (g_currentRoomID && g_currentRoomID.length > 0) ? g_currentRoomID : @"default_room";
+                NSString *streamID = [NSString stringWithFormat:@"s-%@-%@", room, uid];
 
-        if (streamID && [zegoApi respondsToSelector:@selector(startPublishing:title:flag:)]) {
-            [zegoApi startPublishing:streamID title:@"GhostMic" flag:0];
+                if ([zegoApi respondsToSelector:@selector(startPublishing:title:flag:)]) {
+                    [zegoApi startPublishing:streamID title:@"OffSeatMic" flag:0];
+                    g_isGhostPublishing = YES;
+                }
+            }
+        } @catch (NSException *e) {}
+    } else {
+        if (g_isGhostPublishing) {
+            @try {
+                if ([zegoApi respondsToSelector:@selector(stopPublishing)]) {
+                    [zegoApi stopPublishing];
+                }
+            } @catch (NSException *e) {}
+            g_isGhostPublishing = NO;
         }
-    } @catch (NSException *e) {}
+    }
 }
 
 // ---------------------- 线程安全 MP3 解码 ----------------------
@@ -326,10 +340,8 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
         [zegoApi enableMic:YES];
     }
 
-    // 满位独立推流触发
-    if (kGhostMicMode) {
-        ProcessGhostMicPublish(zegoApi);
-    }
+    // 处理台下直接开麦推流状态
+    HandleOffSeatSpeakToggle(zegoApi, kOffSeatSpeak);
 
     if (kCurrentFightMode == FightMode_Normal) {
         if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
@@ -362,7 +374,6 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
     // 2. 核心清晰度重塑：切除中低频发闷区，中高频拉满保证极致清晰
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
         if (kCurrentFightMode == FightMode_New) {
-            // 【新清晰】：人声齿音极度清晰穿透
             [zegoApi setAudioEqualizerGain:6.0f index:0];    // 31Hz
             [zegoApi setAudioEqualizerGain:10.0f index:1];   // 62Hz 50Hz嗡鸣
             [zegoApi setAudioEqualizerGain:4.0f index:2];    // 125Hz 基础胸腔音
@@ -374,7 +385,6 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
             [zegoApi setAudioEqualizerGain:18.0f index:8];   // 8kHz 亮感
             [zegoApi setAudioEqualizerGain:12.0f index:9];   // 16kHz
         } else if (kCurrentFightMode == FightMode_Old) {
-            // 【旧清晰】：强力电台过载 + 保持吐字清晰
             [zegoApi setAudioEqualizerGain:12.0f index:0];
             [zegoApi setAudioEqualizerGain:16.0f index:1];
             [zegoApi setAudioEqualizerGain:10.0f index:2];
@@ -386,7 +396,6 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
             [zegoApi setAudioEqualizerGain:20.0f index:8];
             [zegoApi setAudioEqualizerGain:16.0f index:9];
         } else if (kCurrentFightMode == FightMode_Super) {
-            // 【超级战斗】：全频段爆破过载 + 咬字特化清晰
             [zegoApi setAudioEqualizerGain:20.0f index:0];
             [zegoApi setAudioEqualizerGain:24.0f index:1];
             [zegoApi setAudioEqualizerGain:18.0f index:2];
@@ -404,30 +413,16 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
     TriggerZegoEffectPush(YES);
 }
 
-// ---------------------- Hook 业务与满位绕过 ----------------------
-%hook SKVoiceRoomManager
-
-- (BOOL)isMicFull {
-    if (kGhostMicMode) return NO; // 满位模式下欺骗业务层有空位
-    return %orig;
-}
-
-- (BOOL)canSpeakWithoutSeat {
-    if (kGhostMicMode) return YES;
-    return %orig;
-}
-
-%end
-
+// ---------------------- Hook 业务与麦克风 ----------------------
 %hook SKAudioRoomMicroSetting
 
 - (BOOL)isMute {
-    if (kForceOpenMic || kGhostMicMode) return NO;
+    if (kForceOpenMic || kOffSeatSpeak) return NO;
     return %orig;
 }
 
 - (BOOL)isUserOnMic:(NSString *)uid {
-    if (kGhostMicMode) return YES;
+    if (kOffSeatSpeak) return YES;
     return %orig;
 }
 
@@ -436,7 +431,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 %hook SKAudioZegoManager
 
 - (void)enableMic:(BOOL)enable {
-    if (kForceOpenMic || kGhostMicMode) {
+    if (kForceOpenMic || kOffSeatSpeak) {
         %orig(YES);
     } else {
         %orig(enable);
@@ -447,7 +442,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 }
 
 - (BOOL)micEnabled {
-    if (kForceOpenMic || kGhostMicMode) return YES;
+    if (kForceOpenMic || kOffSeatSpeak) return YES;
     return %orig;
 }
 
@@ -456,7 +451,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 %hook SKMicrophonePermissionManager
 
 + (BOOL)hasMicrophonePermission {
-    if (kForceOpenMic || kGhostMicMode) return YES;
+    if (kForceOpenMic || kOffSeatSpeak) return YES;
     return %orig;
 }
 
@@ -482,7 +477,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 
 - (bool)enableMic:(bool)enable {
     g_activeZegoApi = self;
-    if (kForceOpenMic || kGhostMicMode) return %orig(YES);
+    if (kForceOpenMic || kOffSeatSpeak) return %orig(YES);
     return %orig(enable);
 }
 
@@ -525,8 +520,13 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 }
 
 - (bool)stopPublishing {
-    TriggerZegoEffectPush(NO);
-    return %orig;
+    // 台下开麦模式下拦截 stopPublishing，防止 App 终止幽灵推流
+    if (!kOffSeatSpeak) {
+        TriggerZegoEffectPush(NO);
+        g_isGhostPublishing = NO;
+        return %orig;
+    }
+    return YES;
 }
 
 %end
@@ -539,7 +539,7 @@ static void StartKeepAliveService() {
         g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
         dispatch_source_set_event_handler(g_keepAliveTimer, ^{
-            if (g_activeZegoApi && (kCurrentFightMode != FightMode_Normal || kGhostMicMode)) {
+            if (g_activeZegoApi && (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak)) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     ApplyPreciseRadioFightDSP(g_activeZegoApi);
                 });
@@ -788,16 +788,17 @@ static void StartKeepAliveService() {
         // 版本信息
         CGFloat y = 142;
         NSArray *info = @[
-            @"FightVoicePro v6.0.0",
+            @"FightVoicePro v7.0.0",
+            @"",
+            @"台下直接开麦: 观众席直接推流",
+            @"  开关ON -> startPublishing",
+            @"  开关OFF -> stopPublishing",
+            @"  stopPublishing hook 拦截",
+            @"  loginRoom 截获 RoomID",
             @"",
             @"单通道优化: 削减250-500Hz浑浊",
             @"  1kHz +15dB / 2kHz +22dB",
             @"  4kHz +24dB 齿音极限清晰",
-            @"",
-            @"满位强开麦: 独立幽灵推流",
-            @"  isMicFull -> NO",
-            @"  canSpeakWithoutSeat -> YES",
-            @"  loginRoom 截获 RoomID",
             @"",
             @"推流: 800/1500/2500 极限增益",
             @"伴奏: initWithPlayerType:0",
@@ -891,7 +892,7 @@ static void StartKeepAliveService() {
 @property (nonatomic, strong) SettingManagerView *settingPageView;
 @property (nonatomic, strong) UIScrollView *funcScrollView;
 @property (nonatomic, strong) UISwitch *swForceMic;
-@property (nonatomic, strong) UISwitch *swGhostMic;
+@property (nonatomic, strong) UISwitch *swOffSeatSpeak;
 @property (nonatomic, strong) UISwitch *swNewFight;
 @property (nonatomic, strong) UISwitch *swOldFight;
 @property (nonatomic, strong) UISwitch *swSuperFight;
@@ -983,8 +984,7 @@ static void StartKeepAliveService() {
     proc.clipsToBounds = YES;
     [self.funcPageView addSubview:proc];
 
-    // 包含独立「满位强开麦」控制
-    NSArray *titles = @[@"强制开麦", @"满位强开麦", @"屏蔽滋啦杂音", @"新清晰搏击效果", @"旧清晰搏击效果", @"超级战斗效果"];
+    NSArray *titles = @[@"强制开麦", @"台下直接开麦", @"屏蔽滋啦杂音", @"新清晰搏击效果", @"旧清晰搏击效果", @"超级战斗效果"];
     for (int i = 0; i < titles.count; i++) {
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8, 30 + i * 32, self.funcPageView.frame.size.width - 16, 28)];
         row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
@@ -1003,7 +1003,7 @@ static void StartKeepAliveService() {
         [row addSubview:sw];
 
         if (i == 0) { self.swForceMic = sw; [sw setOn:kForceOpenMic]; }
-        if (i == 1) { self.swGhostMic = sw; [sw setOn:kGhostMicMode]; }
+        if (i == 1) { self.swOffSeatSpeak = sw; [sw setOn:kOffSeatSpeak]; }
         if (i == 3) { self.swNewFight = sw; [sw setOn:YES]; }
         if (i == 4) self.swOldFight = sw;
         if (i == 5) self.swSuperFight = sw;
@@ -1049,7 +1049,10 @@ static void StartKeepAliveService() {
 
 - (void)onFuncSwitch:(UISwitch *)s {
     if (s == self.swForceMic) kForceOpenMic = s.isOn;
-    if (s == self.swGhostMic) kGhostMicMode = s.isOn;
+    if (s == self.swOffSeatSpeak) {
+        kOffSeatSpeak = s.isOn;
+        HandleOffSeatSpeakToggle(g_activeZegoApi, kOffSeatSpeak);
+    }
     if (s == self.swNewFight) {
         if (s.isOn) { kCurrentFightMode = FightMode_New; [self.swOldFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
         else { kCurrentFightMode = FightMode_Normal; }

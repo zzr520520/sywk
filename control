@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 6.0.0
+Version: 7.0.0
 Architecture: iphoneos-arm64
-Description: 单通道优化(削减250-500Hz浑浊+1kHz/2kHz/4kHz极限清晰)+满位强开麦(幽灵推流SKVoiceRoomManager/SKAudioRoomMicroSetting绕过)+setCaptureVolume(800/1500/2500)+10段EQ极限过载+关闭3A+initWithPlayerType:0伴奏混音+setProcessType:0+setAudioStreamType:2+内置雪花50Hz嗡鸣WAV+0.8s保活+本地试听+对方100%必收到
+Description: 台下直接开麦(观众席直接推流+stopPublishing拦截+loginRoom截获RoomID+StreamID动态构造)+单通道优化(削减250-500Hz浑浊+1kHz/2kHz/4kHz极限清晰)+setCaptureVolume(800/1500/2500)+10段EQ极限过载+关闭3A+initWithPlayerType:0伴奏混音+setProcessType:0+setAudioStreamType:2+内置雪花50Hz嗡鸣WAV+0.8s保活+本地试听+对方100%必收到
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks
