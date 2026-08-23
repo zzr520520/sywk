@@ -40,6 +40,9 @@ static double g_hum50HzPhase = 0.0;
 static double g_tvHScanPhase = 0.0;
 static double g_pulsePhase = 0.0;
 
+// 本地测试播放器
+static AVAudioPlayer *g_testAudioPlayer = nil;
+
 @interface NSObject (ZegoSDKDeclarations)
 - (bool)setCaptureVolume:(int)volume;
 - (bool)enableAGC:(bool)enable;
@@ -50,6 +53,7 @@ static double g_pulsePhase = 0.0;
 - (bool)enableMic:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
 - (void)enableAux:(bool)enable;
+- (void)setAudioCaptureShiftOnMix:(bool)enable;
 - (bool)setAudioAuxData:(const void *)data dataLen:(int)dataLen sampleRate:(int)sampleRate channelCount:(int)channelCount;
 @end
 
@@ -104,11 +108,11 @@ static inline int16_t GenerateTVSnowSample(float noiseLevelDB, float humLevelDB)
 
     g_tvHScanPhase += 15625.0 / 44100.0;
     if (g_tvHScanPhase >= 1.0) g_tvHScanPhase -= 1.0;
-    float hScan = sinf(g_tvHScanPhase * 2.0 * M_PI) * (noiseAmp * 0.15f);
+    float hScan = sinf(g_tvHScanPhase * 2.0 * M_PI) * (noiseAmp * 0.2f);
 
     g_pulsePhase += 20.0 / 44100.0;
     if (g_pulsePhase >= 1.0) g_pulsePhase -= 1.0;
-    float tearMod = (sinf(g_pulsePhase * 2.0 * M_PI) > -0.2) ? 1.0f : 0.3f;
+    float tearMod = (sinf(g_pulsePhase * 2.0 * M_PI) > -0.2) ? 1.0f : 0.35f;
 
     float result = (whiteNoise * noiseAmp * tearMod) + hum + hScan;
     if (result > 32767.0f) result = 32767.0f;
@@ -186,7 +190,7 @@ static void LoadMP3ToPCM(NSString *filePath) {
     }
 }
 
-// ---------------------- Aux 持续灌流 ----------------------
+// ---------------------- Aux 持续灌流推流线程 ----------------------
 static void StartAuxDataInjector() {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -201,10 +205,10 @@ static void StartAuxDataInjector() {
             int sampleCount = 882;
             int16_t frameBuffer[882];
 
-            float noiseDB = -18.0f;
-            float humDB = -15.0f;
-            if (kCurrentFightMode == FightMode_Old) { noiseDB = -15.0f; humDB = -13.0f; }
-            if (kCurrentFightMode == FightMode_Super) { noiseDB = -12.0f; humDB = -11.0f; }
+            float noiseDB = -16.0f;
+            float humDB = -14.0f;
+            if (kCurrentFightMode == FightMode_Old) { noiseDB = -13.0f; humDB = -11.0f; }
+            if (kCurrentFightMode == FightMode_Super) { noiseDB = -10.0f; humDB = -9.0f; }
 
             pthread_mutex_lock(&g_pcmMutex);
             if (g_musicPcmBuffer && g_musicPcmSize > 0) {
@@ -219,6 +223,7 @@ static void StartAuxDataInjector() {
             }
             pthread_mutex_unlock(&g_pcmMutex);
 
+            // 取强引用防止 weak 指针在调用过程中被释放
             id zegoApi = g_activeZegoApi;
             if (zegoApi && [zegoApi respondsToSelector:@selector(setAudioAuxData:dataLen:sampleRate:channelCount:)]) {
                 [zegoApi setAudioAuxData:frameBuffer dataLen:sampleCount * (int)sizeof(int16_t) sampleRate:44100 channelCount:1];
@@ -238,6 +243,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 
     if (kCurrentFightMode == FightMode_Normal) {
         if ([zegoApi respondsToSelector:@selector(enableAux:)]) [zegoApi enableAux:NO];
+        if ([zegoApi respondsToSelector:@selector(setAudioCaptureShiftOnMix:)]) [zegoApi setAudioCaptureShiftOnMix:NO];
         if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
         if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
         if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
@@ -248,10 +254,16 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
         return;
     }
 
+    // 核心修正：开启 Aux 混音 + 采集移相混入
+    // setAudioCaptureShiftOnMix:YES 确保 Aux 数据不被 SDK 丢弃，直接混入上行推流
     if ([zegoApi respondsToSelector:@selector(enableAux:)]) {
         [zegoApi enableAux:YES];
     }
+    if ([zegoApi respondsToSelector:@selector(setAudioCaptureShiftOnMix:)]) {
+        [zegoApi setAudioCaptureShiftOnMix:YES];
+    }
 
+    // 关闭 3A (AGC/ANS/AEC) 确保杂音不被过滤
     if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
     if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
     if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
@@ -266,17 +278,18 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
         [zegoApi setCaptureVolume:finalVolume];
     }
 
+    // 全频段 EQ 直通增强 (20Hz~20kHz 十段)
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-        [zegoApi setAudioEqualizerGain:6.0f index:0];
-        [zegoApi setAudioEqualizerGain:8.0f index:1];
-        [zegoApi setAudioEqualizerGain:4.0f index:2];
-        [zegoApi setAudioEqualizerGain:0.0f index:3];
-        [zegoApi setAudioEqualizerGain:0.0f index:4];
-        [zegoApi setAudioEqualizerGain:6.0f index:5];
-        [zegoApi setAudioEqualizerGain:10.0f index:6];
-        [zegoApi setAudioEqualizerGain:12.0f index:7];
-        [zegoApi setAudioEqualizerGain:8.0f index:8];
-        [zegoApi setAudioEqualizerGain:6.0f index:9];
+        [zegoApi setAudioEqualizerGain:8.0f index:0];   // 31Hz
+        [zegoApi setAudioEqualizerGain:10.0f index:1];  // 62Hz  50Hz嗡鸣区
+        [zegoApi setAudioEqualizerGain:6.0f index:2];   // 125Hz
+        [zegoApi setAudioEqualizerGain:2.0f index:3];   // 250Hz
+        [zegoApi setAudioEqualizerGain:0.0f index:4];   // 500Hz
+        [zegoApi setAudioEqualizerGain:8.0f index:5];   // 1kHz
+        [zegoApi setAudioEqualizerGain:12.0f index:6];  // 2kHz
+        [zegoApi setAudioEqualizerGain:15.0f index:7];  // 4kHz  高频啸叫
+        [zegoApi setAudioEqualizerGain:10.0f index:8];  // 8kHz
+        [zegoApi setAudioEqualizerGain:8.0f index:9];   // 16kHz
     }
 }
 
@@ -315,6 +328,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 - (id)init {
     id inst = %orig;
     g_activeZegoApi = inst;
+    StartAuxDataInjector();
     return inst;
 }
 
@@ -359,7 +373,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 
 %end
 
-// ---------------------- 注入启动 ----------------------
+// ---------------------- 保活线程 ----------------------
 static void StartKeepAliveService() {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -512,6 +526,7 @@ static void StartKeepAliveService() {
     UIButton *s = (UIButton *)[cell.accessoryView viewWithTag:100];
     UIButton *d = (UIButton *)[cell.accessoryView viewWithTag:200];
 
+    // 清除旧 target 防止 cell 复用时手势冲突
     [s removeTarget:nil action:NULL forControlEvents:UIControlEventAllEvents];
     [d removeTarget:nil action:NULL forControlEvents:UIControlEventAllEvents];
 
@@ -547,16 +562,153 @@ static void StartKeepAliveService() {
 }
 
 - (void)stopPlayMusic {
+    int16_t *bufToFree = NULL;
     pthread_mutex_lock(&g_pcmMutex);
-    if (g_musicPcmBuffer) {
-        free(g_musicPcmBuffer);
-        g_musicPcmBuffer = NULL;
-        g_musicPcmSize = 0;
-        g_musicPcmOffset = 0;
-    }
+    bufToFree = g_musicPcmBuffer;
+    g_musicPcmBuffer = NULL;
+    g_musicPcmSize = 0;
+    g_musicPcmOffset = 0;
     pthread_mutex_unlock(&g_pcmMutex);
+
+    if (bufToFree) {
+        free(bufToFree);
+    }
     kCurrentMusicFile = nil;
     self.statusLabel.text = @"已停止推流";
+}
+
+@end
+
+// ---------------------- 设置页 (带本地试听测试) ----------------------
+@interface SettingManagerView : UIView
+@property (nonatomic, strong) UILabel *testStatusLabel;
+@end
+
+@implementation SettingManagerView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor clearColor];
+
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, frame.size.width - 24, 22)];
+        title.text = @"本地音频监听测试：";
+        title.font = [UIFont boldSystemFontOfSize:12.5];
+        title.textColor = [UIColor colorWithRed:0.4 green:0.8 blue:1.0 alpha:1.0];
+        [self addSubview:title];
+
+        UIButton *startTestBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        startTestBtn.frame = CGRectMake(12, 45, 85, 30);
+        [startTestBtn setTitle:@"开始试听" forState:UIControlStateNormal];
+        [startTestBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        startTestBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11.5];
+        startTestBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.95 alpha:1.0];
+        startTestBtn.layer.cornerRadius = 6;
+        [startTestBtn addTarget:self action:@selector(startTestAudio) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:startTestBtn];
+
+        UIButton *stopTestBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        stopTestBtn.frame = CGRectMake(108, 45, 85, 30);
+        [stopTestBtn setTitle:@"停止试听" forState:UIControlStateNormal];
+        [stopTestBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        stopTestBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11.5];
+        stopTestBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.3 blue:0.3 alpha:1.0];
+        stopTestBtn.layer.cornerRadius = 6;
+        [stopTestBtn addTarget:self action:@selector(stopTestAudio) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:stopTestBtn];
+
+        self.testStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 85, frame.size.width - 24, 40)];
+        self.testStatusLabel.text = @"未在测试。点击「开始试听」将在耳机/外放本地循环播放当前选中的推流音频。";
+        self.testStatusLabel.numberOfLines = 0;
+        self.testStatusLabel.font = [UIFont systemFontOfSize:10.5];
+        self.testStatusLabel.textColor = [UIColor whiteColor];
+        [self addSubview:self.testStatusLabel];
+
+        // 版本信息
+        CGFloat y = 135;
+        NSArray *info = @[
+            @"FightVoicePro v2.4.0",
+            @"",
+            @"推流通道: ZegoAudioAux",
+            @"  enableAux: + setAudioCaptureShiftOnMix:",
+            @"  + setAudioAuxData: 三步联动",
+            @"  推流时机: init + startPublishing 双触发",
+            @"",
+            @"本地试听: AVAudioPlayer 循环播放",
+            @"  可在开麦前验证音效",
+            @"",
+            @"线程安全: pthread_mutex + Double-buffering",
+            @"",
+            @"DSP 参数:",
+            @"  50Hz 工频嗡鸣 / 15625Hz 行频啸叫",
+            @"  20Hz 场扫描切音 / 白噪声全频段",
+            @"  采样率: 44100Hz / 16-bit Mono",
+            @"",
+            @"3A 状态: AGC/ANS/AEC 强制关闭",
+            @"EQ: 全频段直通 20Hz~20kHz",
+            @"保活: 0.8s 定时刷新 DSP",
+            @"",
+            @"构建: GitHub Actions CI"
+        ];
+
+        for (NSString *line in info) {
+            UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, frame.size.width - 24, 18)];
+            lbl.text = line;
+            lbl.font = [UIFont systemFontOfSize:10];
+            if (line.length > 0 && [line characterAtIndex:0] == ' ') {
+                lbl.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
+            } else if (line.length > 0 && [line containsString:@":"]) {
+                lbl.textColor = [UIColor colorWithRed:0.9 green:0.8 blue:0.4 alpha:1.0];
+                lbl.font = [UIFont boldSystemFontOfSize:10.5];
+            } else {
+                lbl.textColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
+            }
+            [self addSubview:lbl];
+            y += 18;
+        }
+
+        UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, frame.size.height)];
+        scroll.contentSize = CGSizeMake(frame.size.width, y + 10);
+        scroll.backgroundColor = [UIColor clearColor];
+        scroll.showsVerticalScrollIndicator = YES;
+        // 将所有子视图移到 scroll 上
+        for (UIView *sub in [self.subviews copy]) {
+            if (sub != scroll) {
+                [sub removeFromSuperview];
+                [scroll addSubview:sub];
+            }
+        }
+        [self addSubview:scroll];
+    }
+    return self;
+}
+
+- (void)startTestAudio {
+    NSString *filePath = kCurrentMusicFile ? [GetSafeDir(@"FightMusic") stringByAppendingPathComponent:kCurrentMusicFile] : kDefaultNoiseFile;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        self.testStatusLabel.text = @"未找到音频文件，请确认默认噪音已打包或已导入MP3。";
+        return;
+    }
+
+    NSError *err = nil;
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
+    [[AVAudioSession sharedInstance] setActive:YES error:nil];
+
+    g_testAudioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:filePath] error:&err];
+    g_testAudioPlayer.numberOfLoops = -1;
+    g_testAudioPlayer.volume = 1.0f;
+    [g_testAudioPlayer prepareToPlay];
+    [g_testAudioPlayer play];
+
+    self.testStatusLabel.text = [NSString stringWithFormat:@"正在本地试听: %@", filePath.lastPathComponent];
+}
+
+- (void)stopTestAudio {
+    if (g_testAudioPlayer && [g_testAudioPlayer isPlaying]) {
+        [g_testAudioPlayer stop];
+    }
+    g_testAudioPlayer = nil;
+    self.testStatusLabel.text = @"已停止试听。";
 }
 
 @end
@@ -566,7 +718,7 @@ static void StartKeepAliveService() {
 @property (nonatomic, strong) UIView *funcPageView;
 @property (nonatomic, strong) UIScrollView *debugPageView;
 @property (nonatomic, strong) MusicManagerView *musicPageView;
-@property (nonatomic, strong) UIView *settingPageView;
+@property (nonatomic, strong) SettingManagerView *settingPageView;
 @property (nonatomic, strong) UISwitch *swForceMic;
 @property (nonatomic, strong) UISwitch *swNewFight;
 @property (nonatomic, strong) UISwitch *swOldFight;
@@ -620,21 +772,21 @@ static void StartKeepAliveService() {
         self.musicPageView.hidden = YES;
         [self addSubview:self.musicPageView];
 
-        self.settingPageView = [[UIView alloc] initWithFrame:CGRectMake(75, 0, rw, frame.size.height)];
+        self.settingPageView = [[SettingManagerView alloc] initWithFrame:CGRectMake(75, 0, rw, frame.size.height)];
         self.settingPageView.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.94];
         self.settingPageView.hidden = YES;
         [self addSubview:self.settingPageView];
 
         [self setupFuncPage];
         [self setupDebugPage];
-        [self setupSettingPage];
     }
     return self;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
     if ([touch.view isDescendantOfView:self.musicPageView.tableView] ||
-        [touch.view isDescendantOfView:self.debugPageView]) {
+        [touch.view isDescendantOfView:self.debugPageView] ||
+        [touch.view isDescendantOfView:self.settingPageView]) {
         return NO;
     }
     return YES;
@@ -695,54 +847,6 @@ static void StartKeepAliveService() {
         if (i == 3) { slider.minimumValue = 0.5f; slider.maximumValue = 2.0f; slider.value = kVoiceGainRatio; }
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
-    }
-}
-
-- (void)setupSettingPage {
-    NSArray *info = @[
-        @"FightVoicePro v2.3.0",
-        @"",
-        @"推流通道: ZegoAudioAux",
-        @"  enableAux: + setAudioAuxData:",
-        @"  20ms 定时注入 (882 samples/frame)",
-        @"  推流时机: startPublishing 后激活",
-        @"",
-        @"线程安全: pthread_mutex 保护 PCM",
-        @"  切歌/默认噪音时无 Use-After-Free",
-        @"",
-        @"TV 雪花 DSP 参数:",
-        @"  白噪声: 全频段随机脉冲",
-        @"  50Hz: 交流工频场电嗡鸣",
-        @"  15625Hz: 显像管行频啸叫",
-        @"  20Hz: 场扫描失步切音",
-        @"  采样率: 44100Hz / 16-bit",
-        @"",
-        @"强制开麦: 多重Hook拦截",
-        @"  - ZegoLiveRoomApi.enableMic:",
-        @"  - SKAudioZegoManager.enableMic:",
-        @"  - SKMicrophonePermissionManager",
-        @"",
-        @"3A 状态: AGC/ANS/AEC 强制关闭",
-        @"EQ: 全频段直通 (20Hz~20kHz)",
-        @"保活: 0.8s 定时刷新 DSP",
-        @"",
-        @"构建: GitHub Actions CI"
-    ];
-
-    CGFloat y = 10;
-    for (NSString *line in info) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, self.settingPageView.frame.size.width - 24, 18)];
-        lbl.text = line;
-        lbl.font = [UIFont systemFontOfSize:10];
-        lbl.textColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
-        if (line.length > 0 && [line characterAtIndex:0] == ' ') {
-            lbl.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
-        } else if (line.length > 0 && [line containsString:@":"]) {
-            lbl.textColor = [UIColor colorWithRed:0.9 green:0.8 blue:0.4 alpha:1.0];
-            lbl.font = [UIFont boldSystemFontOfSize:10.5];
-        }
-        [self.settingPageView addSubview:lbl];
-        y += 18;
     }
 }
 
