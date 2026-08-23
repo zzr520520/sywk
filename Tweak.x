@@ -6,8 +6,6 @@
 #import <stdlib.h>
 #import <pthread.h>
 
-#define kDefaultNoiseFile @"/Library/Application Support/com.battlemaster/tv_snow.mp3"
-
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
     FightMode_New,      // 新清晰搏击 (500 音量 + 电视雪花撕扯)
@@ -30,18 +28,20 @@ static __weak id g_activeZegoApi = nil;
 static dispatch_source_t g_keepAliveTimer = nil;
 static dispatch_source_t g_auxPushTimer = nil;
 
-// 线程安全互斥锁与 PCM 内存池
+// 线程安全互斥锁与动态导入 PCM 内存池
 static pthread_mutex_t g_pcmMutex = PTHREAD_MUTEX_INITIALIZER;
-static int16_t *g_musicPcmBuffer = NULL;
-static size_t g_musicPcmSize = 0;
-static size_t g_musicPcmOffset = 0;
+static int16_t *g_customPcmBuffer = NULL;
+static size_t g_customPcmSize = 0;
+static size_t g_customPcmOffset = 0;
 
-static double g_hum50HzPhase = 0.0;
-static double g_tvHScanPhase = 0.0;
-static double g_pulsePhase = 0.0;
+// 内置默认 PCM 环形缓冲区 (由硬编码雪花+50Hz强嗡鸣直接填充, 不依赖外部文件)
+#define EMBEDDED_PCM_LEN 44100
+static int16_t g_embeddedPcmBuffer[EMBEDDED_PCM_LEN];
+static size_t g_embeddedPcmOffset = 0;
 
-// 本地测试播放器
-static AVAudioPlayer *g_testAudioPlayer = nil;
+// 本地测试播放引擎
+static AVAudioEngine *g_testAudioEngine = nil;
+static AVAudioPlayerNode *g_testPlayerNode = nil;
 
 @interface NSObject (ZegoSDKDeclarations)
 - (bool)setCaptureVolume:(int)volume;
@@ -58,6 +58,7 @@ static AVAudioPlayer *g_testAudioPlayer = nil;
 @end
 
 // ---------------------- 前置函数声明 ----------------------
+static void InitEmbeddedPCMData(void);
 static void LoadMP3ToPCM(NSString *filePath);
 static void ApplyPreciseRadioFightDSP(id zegoApi);
 static void StartAuxDataInjector(void);
@@ -96,31 +97,41 @@ static UIWindow *GetKeyWindow() {
     return keyWindow;
 }
 
-// ---------------------- 电视无信号雪花合成 ----------------------
-static inline int16_t GenerateTVSnowSample(float noiseLevelDB, float humLevelDB) {
-    float whiteNoise = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f);
-    float noiseAmp = 32767.0f * powf(10.0f, noiseLevelDB / 20.0f);
+// ---------------------- 启动初始化内置 1秒 电视雪花+50Hz强嗡鸣数据 ----------------------
+static void InitEmbeddedPCMData() {
+    double humPhase = 0.0;
+    double tvScanPhase = 0.0;
+    double pulsePhase = 0.0;
 
-    g_hum50HzPhase += 50.0 / 44100.0;
-    if (g_hum50HzPhase >= 1.0) g_hum50HzPhase -= 1.0;
-    float humAmp = 32767.0f * powf(10.0f, humLevelDB / 20.0f);
-    float hum = sinf(g_hum50HzPhase * 2.0 * M_PI) * humAmp;
+    for (int i = 0; i < EMBEDDED_PCM_LEN; i++) {
+        // 1. 白噪声基底 (-14dB 响亮电平)
+        float whiteNoise = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f);
+        float noiseAmp = 32767.0f * powf(10.0f, -14.0f / 20.0f);
 
-    g_tvHScanPhase += 15625.0 / 44100.0;
-    if (g_tvHScanPhase >= 1.0) g_tvHScanPhase -= 1.0;
-    float hScan = sinf(g_tvHScanPhase * 2.0 * M_PI) * (noiseAmp * 0.2f);
+        // 2. 50Hz 工频场电强嗡鸣 (-12dB)
+        humPhase += 50.0 / 44100.0;
+        if (humPhase >= 1.0) humPhase -= 1.0;
+        float hum = sinf(humPhase * 2.0 * M_PI) * (32767.0f * powf(10.0f, -12.0f / 20.0f));
 
-    g_pulsePhase += 20.0 / 44100.0;
-    if (g_pulsePhase >= 1.0) g_pulsePhase -= 1.0;
-    float tearMod = (sinf(g_pulsePhase * 2.0 * M_PI) > -0.2) ? 1.0f : 0.35f;
+        // 3. 15.625kHz 显像管高频刺耳载波
+        tvScanPhase += 15625.0 / 44100.0;
+        if (tvScanPhase >= 1.0) tvScanPhase -= 1.0;
+        float scan = sinf(tvScanPhase * 2.0 * M_PI) * (noiseAmp * 0.25f);
 
-    float result = (whiteNoise * noiseAmp * tearMod) + hum + hScan;
-    if (result > 32767.0f) result = 32767.0f;
-    if (result < -32768.0f) result = -32768.0f;
-    return (int16_t)result;
+        // 4. 18Hz 切音撕拉调制
+        pulsePhase += 18.0 / 44100.0;
+        if (pulsePhase >= 1.0) pulsePhase -= 1.0;
+        float pulse = (sinf(pulsePhase * 2.0 * M_PI) > -0.15) ? 1.0f : 0.35f;
+
+        float sample = (whiteNoise * noiseAmp * pulse) + hum + scan;
+        if (sample > 32767.0f) sample = 32767.0f;
+        if (sample < -32768.0f) sample = -32768.0f;
+
+        g_embeddedPcmBuffer[i] = (int16_t)sample;
+    }
 }
 
-// ---------------------- 线程安全 MP3 解码 ----------------------
+// ---------------------- 线程安全 MP3 动态导入解码 ----------------------
 static void LoadMP3ToPCM(NSString *filePath) {
     if (!filePath || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) return;
 
@@ -177,24 +188,24 @@ static void LoadMP3ToPCM(NSString *filePath) {
         // 锁内仅做原子指针置换 (极短临界区)
         int16_t *oldBufToFree = NULL;
         pthread_mutex_lock(&g_pcmMutex);
-        oldBufToFree = g_musicPcmBuffer;
-        g_musicPcmBuffer = newBuf;
-        g_musicPcmSize = newSize;
-        g_musicPcmOffset = 0;
+        oldBufToFree = g_customPcmBuffer;
+        g_customPcmBuffer = newBuf;
+        g_customPcmSize = newSize;
+        g_customPcmOffset = 0;
         pthread_mutex_unlock(&g_pcmMutex);
 
-        // 锁外释放旧缓冲区 (避免 free 阻塞音频线程)
+        // 锁外释放旧缓冲区
         if (oldBufToFree) {
             free(oldBufToFree);
         }
     }
 }
 
-// ---------------------- Aux 持续灌流推流线程 ----------------------
+// ---------------------- Aux 持续上麦推流注入 ----------------------
 static void StartAuxDataInjector() {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        LoadMP3ToPCM(kDefaultNoiseFile);
+        InitEmbeddedPCMData();
 
         dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
         g_auxPushTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
@@ -205,20 +216,18 @@ static void StartAuxDataInjector() {
             int sampleCount = 882;
             int16_t frameBuffer[882];
 
-            float noiseDB = -16.0f;
-            float humDB = -14.0f;
-            if (kCurrentFightMode == FightMode_Old) { noiseDB = -13.0f; humDB = -11.0f; }
-            if (kCurrentFightMode == FightMode_Super) { noiseDB = -10.0f; humDB = -9.0f; }
-
             pthread_mutex_lock(&g_pcmMutex);
-            if (g_musicPcmBuffer && g_musicPcmSize > 0) {
+            if (g_customPcmBuffer && g_customPcmSize > 0) {
+                // 播放导入的 MP3 音乐
                 for (int i = 0; i < sampleCount; i++) {
-                    frameBuffer[i] = g_musicPcmBuffer[g_musicPcmOffset++];
-                    if (g_musicPcmOffset >= g_musicPcmSize) g_musicPcmOffset = 0;
+                    frameBuffer[i] = g_customPcmBuffer[g_customPcmOffset++];
+                    if (g_customPcmOffset >= g_customPcmSize) g_customPcmOffset = 0;
                 }
             } else {
+                // 循环播放内置电台雪花+50Hz强嗡鸣数据
                 for (int i = 0; i < sampleCount; i++) {
-                    frameBuffer[i] = GenerateTVSnowSample(noiseDB, humDB);
+                    frameBuffer[i] = g_embeddedPcmBuffer[g_embeddedPcmOffset++];
+                    if (g_embeddedPcmOffset >= EMBEDDED_PCM_LEN) g_embeddedPcmOffset = 0;
                 }
             }
             pthread_mutex_unlock(&g_pcmMutex);
@@ -254,8 +263,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
         return;
     }
 
-    // 核心修正：开启 Aux 混音 + 采集移相混入
-    // setAudioCaptureShiftOnMix:YES 确保 Aux 数据不被 SDK 丢弃，直接混入上行推流
+    // 核心修正：开启 Aux 混音 + 采集移相混入 (三步联动)
     if ([zegoApi respondsToSelector:@selector(enableAux:)]) {
         [zegoApi enableAux:YES];
     }
@@ -281,7 +289,7 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
     // 全频段 EQ 直通增强 (20Hz~20kHz 十段)
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
         [zegoApi setAudioEqualizerGain:8.0f index:0];   // 31Hz
-        [zegoApi setAudioEqualizerGain:10.0f index:1];  // 62Hz  50Hz嗡鸣区
+        [zegoApi setAudioEqualizerGain:10.0f index:1];  // 62Hz  50Hz强嗡鸣
         [zegoApi setAudioEqualizerGain:6.0f index:2];   // 125Hz
         [zegoApi setAudioEqualizerGain:2.0f index:3];   // 250Hz
         [zegoApi setAudioEqualizerGain:0.0f index:4];   // 500Hz
@@ -437,7 +445,7 @@ static void StartKeepAliveService() {
         [self addSubview:resetBtn];
 
         self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(202, 8, frame.size.width - 207, 26)];
-        self.statusLabel.text = @"默认噪音";
+        self.statusLabel.text = @"默认内置雪花嗡鸣";
         self.statusLabel.font = [UIFont systemFontOfSize:10];
         self.statusLabel.textColor = [UIColor colorWithRed:0.4 green:0.8 blue:1.0 alpha:1.0];
         [self addSubview:self.statusLabel];
@@ -556,30 +564,42 @@ static void StartKeepAliveService() {
 }
 
 - (void)loadDefaultNoise {
-    LoadMP3ToPCM(kDefaultNoiseFile);
+    // 释放动态导入的 PCM, 回退到内置雪花
+    int16_t *bufToFree = NULL;
+    pthread_mutex_lock(&g_pcmMutex);
+    bufToFree = g_customPcmBuffer;
+    g_customPcmBuffer = NULL;
+    g_customPcmSize = 0;
+    g_customPcmOffset = 0;
+    pthread_mutex_unlock(&g_pcmMutex);
+
+    if (bufToFree) {
+        free(bufToFree);
+    }
+
     kCurrentMusicFile = nil;
-    self.statusLabel.text = @"默认噪音";
+    self.statusLabel.text = @"默认内置雪花嗡鸣";
 }
 
 - (void)stopPlayMusic {
     int16_t *bufToFree = NULL;
     pthread_mutex_lock(&g_pcmMutex);
-    bufToFree = g_musicPcmBuffer;
-    g_musicPcmBuffer = NULL;
-    g_musicPcmSize = 0;
-    g_musicPcmOffset = 0;
+    bufToFree = g_customPcmBuffer;
+    g_customPcmBuffer = NULL;
+    g_customPcmSize = 0;
+    g_customPcmOffset = 0;
     pthread_mutex_unlock(&g_pcmMutex);
 
     if (bufToFree) {
         free(bufToFree);
     }
     kCurrentMusicFile = nil;
-    self.statusLabel.text = @"已停止推流";
+    self.statusLabel.text = @"已切回内置雪花";
 }
 
 @end
 
-// ---------------------- 设置页 (带本地试听测试) ----------------------
+// ---------------------- 设置页 (纯内存驱动本地试听, 100%有声) ----------------------
 @interface SettingManagerView : UIView
 @property (nonatomic, strong) UILabel *testStatusLabel;
 @end
@@ -617,32 +637,31 @@ static void StartKeepAliveService() {
         [stopTestBtn addTarget:self action:@selector(stopTestAudio) forControlEvents:UIControlEventTouchUpInside];
         [self addSubview:stopTestBtn];
 
-        self.testStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 85, frame.size.width - 24, 40)];
-        self.testStatusLabel.text = @"未在测试。点击「开始试听」将在耳机/外放本地循环播放当前选中的推流音频。";
+        self.testStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 85, frame.size.width - 24, 48)];
+        self.testStatusLabel.text = @"内置雪花与50Hz强嗡鸣已就绪。点击「开始试听」将在耳机/外放本地播放。";
         self.testStatusLabel.numberOfLines = 0;
         self.testStatusLabel.font = [UIFont systemFontOfSize:10.5];
         self.testStatusLabel.textColor = [UIColor whiteColor];
         [self addSubview:self.testStatusLabel];
 
         // 版本信息
-        CGFloat y = 135;
+        CGFloat y = 143;
         NSArray *info = @[
-            @"FightVoicePro v2.4.0",
+            @"FightVoicePro v2.5.0",
             @"",
-            @"推流通道: ZegoAudioAux",
+            @"内置PCM: 纯内存硬编码合成",
+            @"  白噪声 -14dB + 50Hz嗡鸣 -12dB",
+            @"  15625Hz行频 + 18Hz撕拉切音",
+            @"  不依赖外部文件, 沙盒零限制",
+            @"",
+            @"推流通道: ZegoAudioAux 三步联动",
             @"  enableAux: + setAudioCaptureShiftOnMix:",
-            @"  + setAudioAuxData: 三步联动",
-            @"  推流时机: init + startPublishing 双触发",
+            @"  + setAudioAuxData:",
             @"",
-            @"本地试听: AVAudioPlayer 循环播放",
-            @"  可在开麦前验证音效",
+            @"本地试听: AVAudioEngine",
+            @"  AVAudioPlayerNode 内存循环播放",
             @"",
             @"线程安全: pthread_mutex + Double-buffering",
-            @"",
-            @"DSP 参数:",
-            @"  50Hz 工频嗡鸣 / 15625Hz 行频啸叫",
-            @"  20Hz 场扫描切音 / 白噪声全频段",
-            @"  采样率: 44100Hz / 16-bit Mono",
             @"",
             @"3A 状态: AGC/ANS/AEC 强制关闭",
             @"EQ: 全频段直通 20Hz~20kHz",
@@ -684,30 +703,45 @@ static void StartKeepAliveService() {
 }
 
 - (void)startTestAudio {
-    NSString *filePath = kCurrentMusicFile ? [GetSafeDir(@"FightMusic") stringByAppendingPathComponent:kCurrentMusicFile] : kDefaultNoiseFile;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
-        self.testStatusLabel.text = @"未找到音频文件，请确认默认噪音已打包或已导入MP3。";
-        return;
-    }
+    [self stopTestAudio];
+
+    AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16 sampleRate:44100 channels:1 interleaved:NO];
+
+    g_testAudioEngine = [[AVAudioEngine alloc] init];
+    g_testPlayerNode = [[AVAudioPlayerNode alloc] init];
+
+    [g_testAudioEngine attachNode:g_testPlayerNode];
+    [g_testAudioEngine connect:g_testPlayerNode to:g_testAudioEngine.mainMixerNode format:format];
+
+    pthread_mutex_lock(&g_pcmMutex);
+    int16_t *srcBuf = (g_customPcmBuffer && g_customPcmSize > 0) ? g_customPcmBuffer : g_embeddedPcmBuffer;
+    size_t srcLen = (g_customPcmBuffer && g_customPcmSize > 0) ? g_customPcmSize : EMBEDDED_PCM_LEN;
+
+    AVAudioPCMBuffer *pcmBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:(AVAudioFrameCount)srcLen];
+    pcmBuffer.frameLength = (AVAudioFrameCount)srcLen;
+    memcpy(pcmBuffer.int16ChannelData[0], srcBuf, srcLen * sizeof(int16_t));
+    pthread_mutex_unlock(&g_pcmMutex);
 
     NSError *err = nil;
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker error:nil];
     [[AVAudioSession sharedInstance] setActive:YES error:nil];
 
-    g_testAudioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:filePath] error:&err];
-    g_testAudioPlayer.numberOfLoops = -1;
-    g_testAudioPlayer.volume = 1.0f;
-    [g_testAudioPlayer prepareToPlay];
-    [g_testAudioPlayer play];
+    [g_testAudioEngine startAndReturnError:&err];
+    [g_testPlayerNode scheduleBuffer:pcmBuffer atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
+    [g_testPlayerNode play];
 
-    self.testStatusLabel.text = [NSString stringWithFormat:@"正在本地试听: %@", filePath.lastPathComponent];
+    self.testStatusLabel.text = kCurrentMusicFile ? [NSString stringWithFormat:@"正在试听MP3: %@", kCurrentMusicFile] : @"正在本地试听: 内置电台雪花+50Hz强嗡鸣";
 }
 
 - (void)stopTestAudio {
-    if (g_testAudioPlayer && [g_testAudioPlayer isPlaying]) {
-        [g_testAudioPlayer stop];
+    if (g_testPlayerNode) {
+        [g_testPlayerNode stop];
+        g_testPlayerNode = nil;
     }
-    g_testAudioPlayer = nil;
+    if (g_testAudioEngine) {
+        [g_testAudioEngine stop];
+        g_testAudioEngine = nil;
+    }
     self.testStatusLabel.text = @"已停止试听。";
 }
 
