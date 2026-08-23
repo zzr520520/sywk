@@ -1,72 +1,65 @@
-# FightVoicePro v5.0.0 - 声控物语搏击音效插件
+# FightVoicePro v6.0.0 - 声控物语搏击音效插件
 
-专用于声控物语的 Zego 原生推流 + 伴奏混音双轨注入搏击音效插件（Tweak）。
+专用于声控物语的单通道优化 + 满位强开麦 + Zego 原生推流搏击音效插件（Tweak）。
 
-## v5.0.0 终极闭环 — 伴奏推流通道硬绑定
+## v6.0.0 双重突破 — 单通道清晰度优化 + 满位强开麦
 
-### 核心问题定位
+### 一、单通道 App 清晰度优化
 
-v4.0.0 的 `ZegoMediaPlayer` 用 `[[cls alloc] init]` 创建播放器，但没有传入 `playerType:0`（伴奏混音类型）或关联主推流通道。SDK 内部将其当成了独立的本地播放器，声音根本没有打包进 WebRTC/Opus 的音频帧。
+语音房 App 推流走 Mono 单声道纯人声模式（VoiceChat Mode），SDK 内部动态削波器在所有频段拉满 +24dB 时会把声音压成一团浑浊的"烂泥"。
 
-### v5.0.0 修复方案
+v6.0.0 的 EQ 曲线针对单通道特性做了物理调校：
 
-1. **initWithPlayerType:0** — 显式创建伴奏混音播放器，关联主推流通道
-2. **setProcessType:0** — 设置伴奏推流混音模式
-3. **setAudioStreamType:2** — 混入上行推流 + 本地监听
-4. **内置雪花+50Hz嗡鸣 WAV 沙盒固化** — App 启动时自动将 PCM 数据封装为标准 WAV 写入 Documents/FightEffects/
-5. **constructor 即时初始化** — 动态库加载即生成 PCM + 写入 WAV 文件
-6. **stopPublishing hook** — 停止推流时同步停止效果播放器
-
-### 与历史版本对比
-
-| 版本 | 方案 | 问题 |
+| 频段 | 增益 | 作用 |
 |------|------|------|
-| v4.0.0 | ZegoMediaPlayer [[alloc] init] | 未关联推流通道，声音不进推流帧 |
-| **v5.0.0** | **initWithPlayerType:0 + setProcessType:0** | **伴奏混音硬绑定推流通道** |
+| 250Hz | -6dB ~ 0dB | 严重削减，去除发闷 |
+| 500Hz | -12dB ~ -4dB | 极限削减，去除浑浊空腔 |
+| 1kHz | +15dB ~ +24dB | 人声基音增强 |
+| 2kHz | +22dB ~ +24dB | 极速电台穿透 |
+| 4kHz | +24dB | 齿音极度清晰 |
 
-### 双轨推流架构
+### 二、满位强开麦（幽灵推流）
 
-```
-┌─ 麦克风轨 ─────────────────────────────┐
-│ setCaptureVolume: 500/1000/1500        │
-│ 10段EQ 极限过载 (+24dB)                │
-│ 彻底关闭 3A (AGC/ANS/AEC)              │
-│ → ZegoLiveRoomApi 上行推流编码器       │
-└──────────────────────────────────────── ┘
+独立开关 `kGhostMicMode`，与基础强制开麦完全解耦：
 
-┌─ 伴奏效果轨 ───────────────────────────┐
-│ ZegoMediaPlayer initWithPlayerType:0   │
-│ setProcessType:0 (伴奏推流混音)        │
-│ setAudioStreamType:2 (推流+本地)       │
-│ setLoopCount:-1 (循环)                 │
-│ setPublishVolume:75/100                │
-│ → 内置雪花+50Hz嗡鸣 WAV 混入推流       │
-└──────────────────────────────────────── ┘
-```
+- **SKVoiceRoomManager** - `isMicFull -> NO`，`canSpeakWithoutSeat -> YES`
+- **SKAudioRoomMicroSetting** - `isMute -> NO`，`isUserOnMic: -> YES`
+- **loginRoom 截获** - 记录 RoomID 用于构造幽灵推流 streamID
+- **ProcessGhostMicPublish** - 自动调用 `startPublishing:title:flag:` 发起独立推流
+
+### 三、增益提升
+
+| 模式 | v5.0 增益 | v6.0 增益 |
+|------|----------|----------|
+| 新清晰 | 500 | 800 |
+| 旧清晰 | 1000 | 1500 |
+| 超级战斗 | 1500 | 2500 |
 
 ## 功能特性
 
+- **单通道 EQ 优化** - 削减 250-500Hz 浑浊区，拉满 1-4kHz 穿透区
+- **满位强开麦** - 独立幽灵推流，绕过麦位限制
 - **Zego 原生上行推流** - setCaptureVolume + 10 段 EQ 极限过载
 - **伴奏混音推流** - initWithPlayerType:0 + setProcessType:0 + setAudioStreamType:2
 - **内置雪花+50Hz嗡鸣** - PCM 硬编码 + WAV 沙盒固化 + constructor 即时初始化
 - **0.8s 保活守护线程** - dispatch_source 高频刷新 DSP 参数
-- **三档爆音模式** - 500 / 1000 / 1500 增益
+- **三档爆音模式** - 800 / 1500 / 2500 增益
 - **本地试听测试** - AVAudioPlayer + 强制扬声器外放
-- **多重强制开麦** - 三层拦截
-- **强制永久关闭 3A** - AGC / ANS / AEC / TransientNoiseSuppress
 - **stopPublishing 同步停止** - 防止效果播放器残留
-- **悬浮控制面板** - 双指双击调出，可拖拽
+- **悬浮控制面板** - 双指双击调出，可拖拽，6 开关自适应滚动
 - **iOS 13+ 兼容** - UIWindowScene 适配
-- **手势冲突防护** - shouldReceiveTouch 去重 + 手势去重
 
 ## 使用方法
 
 1. 安装 `.deb` 或注入 `.dylib` 到声控物语 App
 2. **双指双击**屏幕调出悬浮面板
-3. **功能 Tab**：开启/关闭搏击音效模式（新清晰/旧清晰/超级战斗）
-4. **调试 Tab**：调节各档位音量（100~3000）和人声权重
+3. **功能 Tab**：
+   - 强制开麦：基础麦克风锁定
+   - 满位强开麦：8人满麦时绕过限制直接推流
+   - 新清晰/旧清晰/超级战斗：三档搏击音效
+4. **调试 Tab**：调节各档位音量（100~4000）和人声权重
 5. **音乐 Tab**：导入 MP3/WAV/M4A → 点击「上麦发」推流
-6. **设置 Tab**：本地试听内置雪花音效 + 查看推流状态
+6. **设置 Tab**：本地试听内置雪花音效 + 查看版本信息
 
 ## 构建
 
