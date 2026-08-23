@@ -34,27 +34,34 @@ static void TriggerOffSeatSpeak(BOOL enable);
 - (BOOL)startPublishWithStreamID:(NSString *)streamID;
 - (void)stopPublish;
 - (BOOL)enableMic:(BOOL)enable;
+- (BOOL)enableSpeaker:(BOOL)enable;
 - (void)setCaptureVolume:(int)volume;
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
 - (bool)enableAEC:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
+- (BOOL)startPlayStream:(NSString *)streamID;
 @end
 
 @interface SKAudioZegoManager : NSObject
 + (instancetype)sharedManager;
 @property (nonatomic, strong) ZegoAudioRoomApi *zegoEngine;
+@property (nonatomic, strong) NSArray *allStreamList;
+@property (nonatomic, strong) NSArray *streamList;
 @property (nonatomic, copy) NSString *roomId;
 @property (nonatomic, copy) NSString *userId;
 - (void)startPublishing;
 - (void)stopPublishing;
 - (void)muteMic:(BOOL)mute;
-- (void)setupENgine;
+- (void)muteAllRemote:(BOOL)mute;
+- (BOOL)enableSpeaker:(BOOL)enable;
+- (void)checkAllStreams;
 @end
 
 @interface SKAudioManager : NSObject
 @property (nonatomic, strong) SKAudioZegoManager *manager;
 - (void)muteMic:(BOOL)mute;
+- (BOOL)enableSpeaker:(BOOL)enable;
 @end
 
 // ---------------------- 兼容 iOS 13+ 获取 keyWindow ----------------------
@@ -80,16 +87,20 @@ static UIWindow *GetKeyWindow() {
     return keyWindow;
 }
 
-// ---------------------- 纯净清晰洪亮调音矩阵 (无任何杂音，封顶大音量) ----------------------
+// ---------------------- 纯净清晰洪亮调音矩阵 ----------------------
 static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if (!zegoApi) return;
 
-    // 1. 强制保持麦克风开启
+    // 强制保持扬声器开启，防止全哑
+    if ([zegoApi respondsToSelector:@selector(enableSpeaker:)]) {
+        [zegoApi enableSpeaker:YES];
+    }
+
+    // 强制保持麦克风开启
     if ((kForceOpenMic || kOffSeatSpeak) && [zegoApi respondsToSelector:@selector(enableMic:)]) {
         [zegoApi enableMic:YES];
     }
 
-    // 2. 正常模式恢复
     if (kCurrentFightMode == FightMode_Normal) {
         if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
         if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
@@ -101,12 +112,12 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
         return;
     }
 
-    // 3. 彻底关停 3A 压制，释放无损硬件动态
+    // 关停 3A 压制
     if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
     if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
     if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
 
-    // 4. 封顶纯净音量增益 (400 / 600 / 1000)
+    // 封顶纯净音量增益
     float baseGain = kNewFightGain;
     if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
     if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
@@ -116,22 +127,20 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
         [zegoApi setCaptureVolume:finalVolume];
     }
 
-    // 5. 极致清晰度 EQ (削减发闷区，增强中气与齿音穿透)
+    // 极致清晰度 EQ
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
         if (kCurrentFightMode == FightMode_New) {
-            // 【新清晰】：人声极致清晰、齿音透亮
-            [zegoApi setAudioEqualizerGain:-12.0f index:0]; // 31Hz 切除超低频防闷
-            [zegoApi setAudioEqualizerGain:-8.0f  index:1]; // 62Hz 切除浑浊
-            [zegoApi setAudioEqualizerGain:0.0f   index:2]; // 125Hz 适度基音
-            [zegoApi setAudioEqualizerGain:-8.0f  index:3]; // 250Hz 消除发闷
-            [zegoApi setAudioEqualizerGain:-10.0f index:4]; // 500Hz 消除空腔音
-            [zegoApi setAudioEqualizerGain:16.0f  index:5]; // 1kHz 人声中气穿透
-            [zegoApi setAudioEqualizerGain:22.0f  index:6]; // 2kHz 咬字清晰
-            [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz 齿音极度清晰
-            [zegoApi setAudioEqualizerGain:16.0f  index:8]; // 8kHz 亮感
-            [zegoApi setAudioEqualizerGain:10.0f  index:9]; // 16kHz
+            [zegoApi setAudioEqualizerGain:-12.0f index:0];
+            [zegoApi setAudioEqualizerGain:-8.0f  index:1];
+            [zegoApi setAudioEqualizerGain:0.0f   index:2];
+            [zegoApi setAudioEqualizerGain:-8.0f  index:3];
+            [zegoApi setAudioEqualizerGain:-10.0f index:4];
+            [zegoApi setAudioEqualizerGain:16.0f  index:5];
+            [zegoApi setAudioEqualizerGain:22.0f  index:6];
+            [zegoApi setAudioEqualizerGain:24.0f  index:7];
+            [zegoApi setAudioEqualizerGain:16.0f  index:8];
+            [zegoApi setAudioEqualizerGain:10.0f  index:9];
         } else if (kCurrentFightMode == FightMode_Old) {
-            // 【旧清晰】：饱满洪亮
             [zegoApi setAudioEqualizerGain:-8.0f  index:0];
             [zegoApi setAudioEqualizerGain:-4.0f  index:1];
             [zegoApi setAudioEqualizerGain:4.0f   index:2];
@@ -143,7 +152,6 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
             [zegoApi setAudioEqualizerGain:18.0f  index:8];
             [zegoApi setAudioEqualizerGain:12.0f  index:9];
         } else if (kCurrentFightMode == FightMode_Super) {
-            // 【超级清晰】：全频段封顶功率输出 + 强化高频穿透
             [zegoApi setAudioEqualizerGain:0.0f   index:0];
             [zegoApi setAudioEqualizerGain:4.0f   index:1];
             [zegoApi setAudioEqualizerGain:8.0f   index:2];
@@ -158,20 +166,27 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     }
 }
 
-// ---------------------- 核心：台下直接开麦推流控制 ----------------------
+// ---------------------- 核心：台下开麦与防下麦全哑 ----------------------
 static void TriggerOffSeatSpeak(BOOL enable) {
     if (g_activeZegoManager) {
         SKAudioZegoManager *mgr = (SKAudioZegoManager *)g_activeZegoManager;
+        // 强制解除下行静音
+        [mgr muteAllRemote:NO];
+        [mgr enableSpeaker:YES];
+
         if (enable) {
             [mgr muteMic:NO];
             [mgr startPublishing];
         } else {
             [mgr stopPublishing];
         }
+        // 重新拉起拉流列表，确保听得到所有人
+        [mgr checkAllStreams];
     }
 
     if (g_activeZegoEngine) {
         ZegoAudioRoomApi *api = (ZegoAudioRoomApi *)g_activeZegoEngine;
+        [api enableSpeaker:YES];
         if (enable) {
             [api enableMic:YES];
             [api startPublish];
@@ -198,6 +213,17 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     }
 }
 
+// 拦截下麦静音远端（解决被踢后全哑、听不到任何声音的问题）
+- (void)muteAllRemote:(BOOL)mute {
+    // 强制不静音远端声音，始终保证能听到房内其他人
+    %orig(NO);
+}
+
+- (BOOL)enableSpeaker:(BOOL)enable {
+    // 强制开启扬声器
+    return %orig(YES);
+}
+
 - (void)muteMic:(BOOL)mute {
     if (kForceOpenMic || kOffSeatSpeak) {
         %orig(NO);
@@ -209,12 +235,24 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     });
 }
 
+- (void)stopPublishing {
+    if (kOffSeatSpeak) {
+        // 台下开麦开启时，拦截停止推流指令
+        return;
+    }
+    %orig;
+    // 下麦后强制恢复拉流，防止声音中断
+    [self muteAllRemote:NO];
+    [self checkAllStreams];
+}
+
 - (void)startPublishing {
     %orig;
     g_activeZegoManager = self;
     if (self.zegoEngine) {
         g_activeZegoEngine = self.zegoEngine;
     }
+    [self muteAllRemote:NO];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
     });
@@ -232,6 +270,10 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     }
 }
 
+- (BOOL)enableSpeaker:(BOOL)enable {
+    return %orig(YES);
+}
+
 %end
 
 %hook ZegoAudioRoomApi
@@ -240,6 +282,10 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     id inst = %orig;
     g_activeZegoEngine = inst;
     return inst;
+}
+
+- (BOOL)enableSpeaker:(BOOL)enable {
+    return %orig(YES); // 始终保证接收音频流
 }
 
 - (BOOL)enableMic:(BOOL)enable {
@@ -279,7 +325,6 @@ static void TriggerOffSeatSpeak(BOOL enable) {
 }
 
 - (void)stopPublish {
-    // 台下开麦开启时，拦截下麦停止推流指令
     if (kOffSeatSpeak) {
         return;
     }
@@ -296,9 +341,15 @@ static void StartKeepAliveService() {
         g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
         dispatch_source_set_event_handler(g_keepAliveTimer, ^{
-            if (g_activeZegoEngine && (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak)) {
+            if (g_activeZegoEngine) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+                    // 持续保持远端声音不断开
+                    if ([g_activeZegoEngine respondsToSelector:@selector(enableSpeaker:)]) {
+                        [g_activeZegoEngine enableSpeaker:YES];
+                    }
+                    if (kCurrentFightMode != FightMode_Normal || kOffSeatSpeak) {
+                        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+                    }
                 });
             }
         });

@@ -1,31 +1,52 @@
-# FightVoicePro v7.2.0 - 声控物语搏击音效插件
+# FightVoicePro v7.3.0 - 声控物语搏击音效插件
 
-基于逆向工程报告，修复底层类名不匹配问题，实现真正可用的台下开麦与纯净洪亮推流。
+修复被踢下麦后"全哑"问题，实现被踢后仍能正常收听房间所有人声音 + 台下直接开麦推流。
 
-## v7.2.0 核心突破 — 逆向修复 + 封顶纯净增益
+## v7.3.0 核心突破 — 防被踢全哑 + 拉流保活
 
-### 一、台下开麦失败的根因修复
+### 一、被踢下麦全哑问题根因
 
-| 问题 | v7.1 错误 | v7.2 修复 |
-|------|-----------|-----------|
-| 引擎类名 | ZegoLiveRoomApi | **ZegoAudioRoomApi** |
-| 引擎捕获 | hook init | hook **setupENgine** + zegoEngine 属性 |
-| 推流方法 | startPublishing:title:flag: | **startPublish** / **startPublishWithStreamID:** |
-| 业务管理器 | NSClassFromString 动态查找 | 直接 Hook **SKAudioZegoManager** |
-| 静音方法 | enableMic: | **muteMic:** |
-| 停止推流 | stopPublishing | **stopPublish** |
+根据逆向报告 5.2.2、7.3、9.1.1 节分析：
 
-### 二、封顶纯净增益（消除方波失真）
+| 根因 | 详情 |
+|------|------|
+| 下麦级联静音 | 被踢时 App 调用 muteAllRemote:YES + removeStreamListAll |
+| 服务端鉴权 | 服务端标记 UID 非麦位状态，其他人 stopPlayStream 你的流 |
+| 拉流引擎注销 | 被踢后甚至注销拉流引擎，导致你完全听不到任何声音 |
 
-之前 800/1500/2500 过高导致方波削波失真。v7.2 降至封顶值：
+### 二、防全哑修复方案
 
-| 模式 | v7.1 增益 | v7.2 增益 |
-|------|----------|----------|
-| 新清晰 | 800 | **400** |
-| 旧清晰 | 1500 | **600** |
-| 超级清晰 | 2500 | **1000** |
+| 修复点 | 实现 |
+|--------|------|
+| 拦截 muteAllRemote: | 强制传参 NO，被踢后远端声音不静音 |
+| 拦截 enableSpeaker: | 强制传参 YES，扬声器始终开启 |
+| stopPublishing 后恢复 | 调用 muteAllRemote:NO + checkAllStreams 重新拉起拉流 |
+| 保活线程锁定 | 0.8s 持续调用 enableSpeaker:YES |
+| 台下开麦联动 | TriggerOffSeatSpeak 同时执行 muteAllRemote:NO + enableSpeaker:YES + checkAllStreams |
 
-### 三、纯净人声 EQ 曲线
+### 三、防全哑拦截链路
+
+```
+被踢下麦触发
+  ├─ muteAllRemote:YES  → 拦截为 muteAllRemote:NO (远端不静音)
+  ├─ enableSpeaker:NO   → 拦截为 enableSpeaker:YES (扬声器不关)
+  ├─ stopPublishing     → 台下开麦时拦截 / 否则执行后恢复拉流
+  ├─ stopPublish        → 台下开麦时拦截
+  └─ checkAllStreams    → 重新绑定 allStreamList 拉流列表
+
+保活线程 (0.8s)
+  └─ enableSpeaker:YES  → 持续锁定扬声器开启
+```
+
+### 四、三档清晰模式
+
+| 模式 | 增益 | 特点 |
+|------|------|------|
+| 新清晰 | 400 | 齿音穿透、人声透亮 |
+| 旧清晰 | 600 | 饱满洪亮 |
+| 超级清晰 | 1000 | 封顶功率 + 极致清晰 |
+
+### 五、纯净人声 EQ 曲线
 
 | 频段 | 新清晰 | 旧清晰 | 超级清晰 |
 |------|--------|--------|----------|
@@ -40,34 +61,17 @@
 | 8kHz | +16dB | +18dB | +24dB |
 | 16kHz | +10dB | +12dB | +20dB |
 
-### 四、业务层台下开麦流程
-
-```
-开关 ON
-  ├─ SKAudioZegoManager.muteMic:NO     → 解除静音
-  ├─ SKAudioZegoManager.startPublishing → 触发业务层推流
-  ├─ ZegoAudioRoomApi.enableMic:YES    → 引擎开麦
-  └─ ZegoAudioRoomApi.startPublish      → 引擎直接推流
-
-开关 OFF
-  ├─ SKAudioZegoManager.stopPublishing  → 停止业务推流
-  └─ ZegoAudioRoomApi.stopPublish      → 停止引擎推流
-
-stopPublish 拦截
-  └─ 台下开麦开启时，拦截 App 的下麦停止指令
-```
-
 ## 功能特性
 
+- **防被踢全哑** - 拦截 muteAllRemote + enableSpeaker 强制锁定
+- **拉流保活恢复** - stopPublishing 后自动 checkAllStreams 重新拉流
 - **ZegoAudioRoomApi 正确类名** - 逆向报告确认的真实引擎类
-- **zegoEngine 属性捕获** - 通过 setupENgine 钩子获取底层引擎实例
 - **业务层双管台下开麦** - SKAudioZegoManager + ZegoAudioRoomApi 协同推流
-- **stopPublish 拦截** - 防止 App 终止台下幽灵推流
+- **stopPublish/stopPublishing 双拦截** - 台下开麦时防止 App 终止推流
 - **封顶纯净增益** - 400/600/1000 消除方波失真
 - **纯净人声** - 彻底移除所有背景音效
 - **高通切除** - 31Hz~500Hz 削减，释放动态空间
-- **极限穿透** - 1kHz~4kHz +24dB 齿音极致清晰
-- **0.8s 保活线程** - 高频刷新 DSP 参数
+- **0.8s 保活线程** - enableSpeaker 持续锁定 + DSP 参数刷新
 - **iOS 13+ 兼容** - UIWindowScene 适配 + 手势去重
 
 ## 使用方法
