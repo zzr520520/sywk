@@ -1,81 +1,83 @@
-# FightVoicePro v7.0.0 - 声控物语搏击音效插件
+# FightVoicePro v7.1.0 - 声控物语搏击音效插件
 
-专用于声控物语的台下直接开麦 + 单通道优化 + Zego 原生推流搏击音效插件（Tweak）。
+专用于声控物语的纯净大音量清晰推流 + 业务层台下开麦插件（Tweak）。
 
-## v7.0.0 核心突破 — 台下直接开麦（观众席直接推流）
+## v7.1.0 双重突破 — 纯净清晰 + 业务层台下开麦
 
-### 一、台下直接开麦（幽灵麦/台下推流）
+### 一、彻底移除背景音效，纯净人声极致清晰
 
-独立开关 `kOffSeatSpeak`，与基础强制开麦完全解耦。**人处于观众席（没上麦位）时，打开开关即可直接向房间推流说话**：
+**问题根源**：之前把低频与超低频（31Hz~250Hz）也一同拉满，中低频能量过载引起频谱掩蔽效应（Masking Effect），把中高频咬字与齿音彻底糊住。
 
-| 机制 | 实现 |
+**v7.1.0 方案**：
+
+| 改进 | 详情 |
 |------|------|
-| StreamID 动态构造 | `s-{roomID}-{userID}` 自动拼装合法流 ID |
-| loginRoom 截获 | Hook `loginRoom:role:completionBlock:` 记录 RoomID |
-| userID 获取 | 从 NSUserDefaults `SK_USER_ID_KEY` 读取 |
-| 推流启动 | 开关 ON → `startPublishing:title:flag:` 直接下发推流指令 |
-| 推流停止 | 开关 OFF → `stopPublishing` 自动停止推流 |
-| stopPublishing 拦截 | 台下开麦模式下拦截 App 的 stopPublishing 防止终止幽灵推流 |
-| 麦位绕过 | `isMute -> NO`，`isUserOnMic: -> YES`，`enableMic: -> YES` |
-| 权限绕过 | `hasMicrophonePermission -> YES` |
+| 移除背景音效 | 彻底移除所有雪花杂音、50Hz嗡鸣、PCM音频注入 |
+| 高通切除低频 | 31Hz -12dB / 62Hz -8dB / 250Hz -6dB / 500Hz -10dB |
+| 黄金穿透频段 | 1kHz +16dB / 2kHz +22dB / 4kHz +24dB 齿音极致清晰 |
+| 释放动态空间 | 低频削减腾出全部动态余量给中高频咬字 |
 
-**使用场景**：无需点击任何麦位，直接打开「台下直接开麦」开关，SDK 在后台建流推流，房内所有人实时听到说话与搏击音效。
+### 二、业务层台下直接开麦
 
-### 二、独立控制逻辑
+**问题根源**：App 的上麦推流由 SKAudioZegoManager 与 SKVoiceRoomManager 协同调度，直接调 Zego 的 startPublishing 无法走通业务流程。
 
-| 开关 | 作用 |
-|------|------|
-| 强制开麦 | 在麦位上时防止被控麦、防止被闭麦静音 |
-| 台下直接开麦 | 观众席直接推流，全场可听到，关闭时自动 stopPublishing |
+**v7.1.0 方案**：直接触发业务层原生上麦接口：
 
-### 三、单通道 App 清晰度优化
+| 业务接口 | 作用 |
+|----------|------|
+| SKAudioZegoManager.sharedManager | 获取音频管理器单例 |
+| enableMic:YES | 强制开启麦克风 |
+| startPublish | 触发业务层推流 |
+| SKVoiceRoomManager.shareInstance | 获取房间管理器单例 |
+| takeSeat:1 | 虚拟绑定1号麦位 |
+| reqUserMicroSeat:1 | 请求发言席位 |
+| joinMic | 加入麦克风队列 |
 
-语音房 App 推流走 Mono 单声道纯人声模式（VoiceChat Mode），SDK 内部动态削波器在所有频段拉满 +24dB 时会把声音压成一团浑浊的"烂泥"。
+### 三、三档清晰模式 EQ 曲线
 
-EQ 曲线针对单通道特性做了物理调校：
+| 频段 | 新清晰 | 旧清晰 | 超级清晰 |
+|------|--------|--------|----------|
+| 31Hz | -12dB | -8dB | 0dB |
+| 62Hz | -8dB | -4dB | +4dB |
+| 125Hz | 0dB | +4dB | +8dB |
+| 250Hz | -6dB | -4dB | 0dB |
+| 500Hz | -10dB | -6dB | -2dB |
+| 1kHz | +16dB | +18dB | +24dB |
+| 2kHz | +22dB | +24dB | +24dB |
+| 4kHz | +24dB | +24dB | +24dB |
+| 8kHz | +16dB | +18dB | +24dB |
+| 16kHz | +10dB | +12dB | +20dB |
 
-| 频段 | 增益 | 作用 |
-|------|------|------|
-| 250Hz | -6dB ~ 0dB | 严重削减，去除发闷 |
-| 500Hz | -12dB ~ -4dB | 极限削减，去除浑浊空腔 |
-| 1kHz | +15dB ~ +24dB | 人声基音增强 |
-| 2kHz | +22dB ~ +24dB | 极速电台穿透 |
-| 4kHz | +24dB | 齿音极度清晰 |
-
-### 四、增益提升
+### 四、增益控制
 
 | 模式 | 增益 |
 |------|------|
 | 新清晰 | 800 |
 | 旧清晰 | 1500 |
-| 超级战斗 | 2500 |
+| 超级清晰 | 2500 |
 
 ## 功能特性
 
-- **台下直接开麦** - 观众席直接推流，绕过麦位限制，全场可听
-- **强制开麦** - 麦位防静音/防控麦，独立于台下开麦
-- **单通道 EQ 优化** - 削减 250-500Hz 浑浊区，拉满 1-4kHz 穿透区
-- **Zego 原生上行推流** - setCaptureVolume + 10 段 EQ 极限过载
-- **伴奏混音推流** - initWithPlayerType:0 + setProcessType:0 + setAudioStreamType:2
-- **内置雪花+50Hz嗡鸣** - PCM 硬编码 + WAV 沙盒固化 + constructor 即时初始化
-- **0.8s 保活守护线程** - dispatch_source 高频刷新 DSP 参数
-- **三档爆音模式** - 800 / 1500 / 2500 增益
-- **本地试听测试** - AVAudioPlayer + 强制扬声器外放
-- **stopPublishing 同步停止** - 防止效果播放器残留
-- **悬浮控制面板** - 双指双击调出，可拖拽，6 开关自适应滚动
-- **iOS 13+ 兼容** - UIWindowScene 适配
+- **纯净人声** - 彻底移除所有背景音效与杂音
+- **高通切除** - 31Hz~500Hz 低频浑浊区削减，释放动态空间
+- **极限穿透** - 1kHz~4kHz 拉满 +24dB，咬字极致清晰透亮
+- **业务层台下开麦** - SKAudioZegoManager + SKVoiceRoomManager 双管齐下
+- **强制开麦** - 麦位防静音/防控麦
+- **Zego 原生推流** - setCaptureVolume + 10 段 EQ 极限过载
+- **0.8s 保活线程** - dispatch_source 高频刷新 DSP 参数
+- **三档清晰模式** - 800 / 1500 / 2500 增益
+- **悬浮控制面板** - 双指双击调出，可拖拽
+- **iOS 13+ 兼容** - UIWindowScene 适配 + 手势去重
 
 ## 使用方法
 
 1. 安装 `.deb` 或注入 `.dylib` 到声控物语 App
 2. **双指双击**屏幕调出悬浮面板
 3. **功能 Tab**：
-   - 强制开麦：基础麦克风锁定，防控麦防静音
-   - 台下直接开麦：观众席直接推流，无需上麦位
-   - 新清晰/旧清晰/超级战斗：三档搏击音效
+   - 强制开麦：麦位防静音/防控麦
+   - 台下直接开麦：观众席通过业务层接口直接推流
+   - 新清晰/旧清晰/超级清晰：三档纯净音效
 4. **调试 Tab**：调节各档位音量（100~4000）和人声权重
-5. **音乐 Tab**：导入 MP3/WAV/M4A → 点击「上麦发」推流
-6. **设置 Tab**：本地试听内置雪花音效 + 查看版本信息
 
 ## 构建
 
@@ -86,4 +88,4 @@ make package FINALPACKAGE=1
 
 ## 依赖框架
 
-- UIKit / Foundation / AVFoundation / CoreGraphics / CoreMedia
+- UIKit / Foundation / AVFoundation / CoreGraphics
