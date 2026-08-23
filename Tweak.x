@@ -636,7 +636,7 @@ static void StartKeepAliveService() {
 
 @end
 
-// ---------------------- 设置页 (安全内存 WAV 试听, 100%零崩溃) ----------------------
+// ---------------------- 设置页 (强制扬声器外放 + 确保内存就绪) ----------------------
 @interface SettingManagerView : UIView
 @property (nonatomic, strong) UILabel *testStatusLabel;
 @end
@@ -647,6 +647,9 @@ static void StartKeepAliveService() {
     self = [super initWithFrame:frame];
     if (self) {
         self.backgroundColor = [UIColor clearColor];
+
+        // 打开设置页时再次确保内置 PCM 有数据
+        InitEmbeddedPCMData();
 
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, frame.size.width - 24, 22)];
         title.text = @"本地音频监听测试：";
@@ -675,7 +678,7 @@ static void StartKeepAliveService() {
         [self addSubview:stopTestBtn];
 
         self.testStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 85, frame.size.width - 24, 48)];
-        self.testStatusLabel.text = @"内置雪花与50Hz强嗡鸣已就绪。点击「开始试听」将在耳机/外放本地播放。";
+        self.testStatusLabel.text = @"内置雪花与50Hz强嗡鸣已就绪。点击「开始试听」将在耳机/外放扬声器播放。";
         self.testStatusLabel.numberOfLines = 0;
         self.testStatusLabel.font = [UIFont systemFontOfSize:10.5];
         self.testStatusLabel.textColor = [UIColor whiteColor];
@@ -684,16 +687,18 @@ static void StartKeepAliveService() {
         // 版本信息
         CGFloat y = 143;
         NSArray *info = @[
-            @"FightVoicePro v2.6.0",
+            @"FightVoicePro v2.7.0",
             @"",
             @"内置PCM: 纯内存硬编码合成",
+            @"  constructor构造函数注入即生成",
             @"  白噪声 -14dB + 50Hz嗡鸣 -12dB",
             @"  15625Hz行频 + 18Hz撕拉切音",
             @"  不依赖外部文件, 沙盒零限制",
             @"",
             @"本地试听: AVAudioPlayer (安全模式)",
             @"  内存PCM封装44字节WAV头",
-            @"  高层API格式容错, 100%不崩溃",
+            @"  强制外放 overrideOutputAudioPort",
+            @"  Playback模式 + MixWithOthers",
             @"  循环播放 numberOfLoops=-1",
             @"",
             @"推流通道: ZegoAudioAux 三步联动",
@@ -729,7 +734,6 @@ static void StartKeepAliveService() {
         scroll.contentSize = CGSizeMake(frame.size.width, y + 10);
         scroll.backgroundColor = [UIColor clearColor];
         scroll.showsVerticalScrollIndicator = YES;
-        // 将所有子视图移到 scroll 上
         for (UIView *sub in [self.subviews copy]) {
             if (sub != scroll) {
                 [sub removeFromSuperview];
@@ -743,6 +747,9 @@ static void StartKeepAliveService() {
 
 - (void)startTestAudio {
     [self stopTestAudio];
+
+    // 确保数据已生成 (双重保险)
+    InitEmbeddedPCMData();
 
     pthread_mutex_lock(&g_pcmMutex);
     int16_t *srcBuf = (g_customPcmBuffer && g_customPcmSize > 0) ? g_customPcmBuffer : g_embeddedPcmBuffer;
@@ -758,22 +765,26 @@ static void StartKeepAliveService() {
     }
 
     NSError *err = nil;
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker | AVAudioSessionCategoryOptionMixWithOthers error:nil];
-    [[AVAudioSession sharedInstance] setActive:YES error:nil];
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    // 切换为标准播放模式 (不走电话小听筒)
+    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&err];
+    [session setActive:YES error:&err];
+    // 强制走外放扬声器 (无论插没插耳机)
+    [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&err];
 
     // 使用 AVAudioPlayer 高层API, 自带格式容错, 彻底杜绝 AVAudioEngine AURemoteIO 闪退
     g_safeTestPlayer = [[AVAudioPlayer alloc] initWithData:wavData error:&err];
     if (err || !g_safeTestPlayer) {
-        self.testStatusLabel.text = [NSString stringWithFormat:@"播放器初始化失败: %@", err.localizedDescription];
+        self.testStatusLabel.text = [NSString stringWithFormat:@"播放失败: %@", err.localizedDescription];
         return;
     }
 
-    g_safeTestPlayer.numberOfLoops = -1; // 循环试听
+    g_safeTestPlayer.numberOfLoops = -1; // 循环播放
     g_safeTestPlayer.volume = 1.0f;
     [g_safeTestPlayer prepareToPlay];
     [g_safeTestPlayer play];
 
-    self.testStatusLabel.text = kCurrentMusicFile ? [NSString stringWithFormat:@"正在本地试听MP3: %@", kCurrentMusicFile] : @"正在本地试听: 内置电台雪花+50Hz强嗡鸣";
+    self.testStatusLabel.text = kCurrentMusicFile ? [NSString stringWithFormat:@"正在试听MP3: %@", kCurrentMusicFile] : @"正在试听: 内置电台雪花+50Hz强嗡鸣 (大声播放中)";
 }
 
 - (void)stopTestAudio {
@@ -1037,3 +1048,8 @@ static NSTimeInterval g_lastTapStamp = 0;
 }
 
 %end
+
+// ---------------------- 构造函数: 动态库加载即初始化 PCM 数据 ----------------------
+__attribute__((constructor)) static void InitializeTweak() {
+    InitEmbeddedPCMData(); // 注入即生成雪花嗡鸣数据, 确保点开App第一秒内存里就有数据
+}
