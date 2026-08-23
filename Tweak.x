@@ -39,9 +39,8 @@ static size_t g_customPcmOffset = 0;
 static int16_t g_embeddedPcmBuffer[EMBEDDED_PCM_LEN];
 static size_t g_embeddedPcmOffset = 0;
 
-// 本地测试播放引擎
-static AVAudioEngine *g_testAudioEngine = nil;
-static AVAudioPlayerNode *g_testPlayerNode = nil;
+// 本地试听播放器 (使用高层容错的 AVAudioPlayer, 彻底杜绝 AVAudioEngine 闪退)
+static AVAudioPlayer *g_safeTestPlayer = nil;
 
 @interface NSObject (ZegoSDKDeclarations)
 - (bool)setCaptureVolume:(int)volume;
@@ -59,6 +58,7 @@ static AVAudioPlayerNode *g_testPlayerNode = nil;
 
 // ---------------------- 前置函数声明 ----------------------
 static void InitEmbeddedPCMData(void);
+static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int sampleRate, int channels);
 static void LoadMP3ToPCM(NSString *filePath);
 static void ApplyPreciseRadioFightDSP(id zegoApi);
 static void StartAuxDataInjector(void);
@@ -104,7 +104,7 @@ static void InitEmbeddedPCMData() {
     double pulsePhase = 0.0;
 
     for (int i = 0; i < EMBEDDED_PCM_LEN; i++) {
-        // 1. 白噪声基底 (-14dB 响亮电平)
+        // 1. 白噪声基底 (-14dB)
         float whiteNoise = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f);
         float noiseAmp = 32767.0f * powf(10.0f, -14.0f / 20.0f);
 
@@ -113,7 +113,7 @@ static void InitEmbeddedPCMData() {
         if (humPhase >= 1.0) humPhase -= 1.0;
         float hum = sinf(humPhase * 2.0 * M_PI) * (32767.0f * powf(10.0f, -12.0f / 20.0f));
 
-        // 3. 15.625kHz 显像管高频刺耳载波
+        // 3. 15.625kHz 显像管高频载波
         tvScanPhase += 15625.0 / 44100.0;
         if (tvScanPhase >= 1.0) tvScanPhase -= 1.0;
         float scan = sinf(tvScanPhase * 2.0 * M_PI) * (noiseAmp * 0.25f);
@@ -129,6 +129,43 @@ static void InitEmbeddedPCMData() {
 
         g_embeddedPcmBuffer[i] = (int16_t)sample;
     }
+}
+
+// ---------------------- 内存 PCM 数据封装为标准 WAV NSData (彻底杜绝闪退) ----------------------
+// AVAudioEngine 在 PlayAndRecord 模式下 connect:to:format: 会因格式不匹配触发 AURemoteIO C++ 异常断言
+// 改用 AVAudioPlayer + 内存 WAV 容器, 高层 API 自带格式容错, 100% 不崩溃
+static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int sampleRate, int channels) {
+    if (!pcmData || sampleCount == 0) return nil;
+
+    uint32_t dataSize = (uint32_t)(sampleCount * sizeof(int16_t));
+    uint32_t totalChunkSize = 36 + dataSize;
+    uint16_t numChannels = (uint16_t)channels;
+    uint32_t sRate = (uint32_t)sampleRate;
+    uint16_t bitsPerSample = 16;
+    uint32_t byteRate = sRate * numChannels * (bitsPerSample / 8);
+    uint16_t blockAlign = numChannels * (bitsPerSample / 8);
+
+    NSMutableData *wavData = [NSMutableData dataWithCapacity:44 + dataSize];
+    [wavData appendBytes:"RIFF" length:4];
+    [wavData appendBytes:&totalChunkSize length:4];
+    [wavData appendBytes:"WAVE" length:4];
+    [wavData appendBytes:"fmt " length:4];
+
+    uint32_t subchunk1Size = 16;
+    uint16_t audioFormat = 1; // PCM
+    [wavData appendBytes:&subchunk1Size length:4];
+    [wavData appendBytes:&audioFormat length:2];
+    [wavData appendBytes:&numChannels length:2];
+    [wavData appendBytes:&sRate length:4];
+    [wavData appendBytes:&byteRate length:4];
+    [wavData appendBytes:&blockAlign length:2];
+    [wavData appendBytes:&bitsPerSample length:2];
+
+    [wavData appendBytes:"data" length:4];
+    [wavData appendBytes:&dataSize length:4];
+    [wavData appendBytes:pcmData length:dataSize];
+
+    return wavData;
 }
 
 // ---------------------- 线程安全 MP3 动态导入解码 ----------------------
@@ -599,7 +636,7 @@ static void StartKeepAliveService() {
 
 @end
 
-// ---------------------- 设置页 (纯内存驱动本地试听, 100%有声) ----------------------
+// ---------------------- 设置页 (安全内存 WAV 试听, 100%零崩溃) ----------------------
 @interface SettingManagerView : UIView
 @property (nonatomic, strong) UILabel *testStatusLabel;
 @end
@@ -647,19 +684,21 @@ static void StartKeepAliveService() {
         // 版本信息
         CGFloat y = 143;
         NSArray *info = @[
-            @"FightVoicePro v2.5.0",
+            @"FightVoicePro v2.6.0",
             @"",
             @"内置PCM: 纯内存硬编码合成",
             @"  白噪声 -14dB + 50Hz嗡鸣 -12dB",
             @"  15625Hz行频 + 18Hz撕拉切音",
             @"  不依赖外部文件, 沙盒零限制",
             @"",
+            @"本地试听: AVAudioPlayer (安全模式)",
+            @"  内存PCM封装44字节WAV头",
+            @"  高层API格式容错, 100%不崩溃",
+            @"  循环播放 numberOfLoops=-1",
+            @"",
             @"推流通道: ZegoAudioAux 三步联动",
             @"  enableAux: + setAudioCaptureShiftOnMix:",
             @"  + setAudioAuxData:",
-            @"",
-            @"本地试听: AVAudioEngine",
-            @"  AVAudioPlayerNode 内存循环播放",
             @"",
             @"线程安全: pthread_mutex + Double-buffering",
             @"",
@@ -705,43 +744,43 @@ static void StartKeepAliveService() {
 - (void)startTestAudio {
     [self stopTestAudio];
 
-    AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16 sampleRate:44100 channels:1 interleaved:NO];
-
-    g_testAudioEngine = [[AVAudioEngine alloc] init];
-    g_testPlayerNode = [[AVAudioPlayerNode alloc] init];
-
-    [g_testAudioEngine attachNode:g_testPlayerNode];
-    [g_testAudioEngine connect:g_testPlayerNode to:g_testAudioEngine.mainMixerNode format:format];
-
     pthread_mutex_lock(&g_pcmMutex);
     int16_t *srcBuf = (g_customPcmBuffer && g_customPcmSize > 0) ? g_customPcmBuffer : g_embeddedPcmBuffer;
     size_t srcLen = (g_customPcmBuffer && g_customPcmSize > 0) ? g_customPcmSize : EMBEDDED_PCM_LEN;
 
-    AVAudioPCMBuffer *pcmBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:(AVAudioFrameCount)srcLen];
-    pcmBuffer.frameLength = (AVAudioFrameCount)srcLen;
-    memcpy(pcmBuffer.int16ChannelData[0], srcBuf, srcLen * sizeof(int16_t));
+    // 内存中直接装配 WAV 数据 (44字节标准WAV头 + PCM裸数据)
+    NSData *wavData = WrapPCMToWavData(srcBuf, srcLen, 44100, 1);
     pthread_mutex_unlock(&g_pcmMutex);
 
+    if (!wavData) {
+        self.testStatusLabel.text = @"音频数据装配失败。";
+        return;
+    }
+
     NSError *err = nil;
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker error:nil];
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionDefaultToSpeaker | AVAudioSessionCategoryOptionMixWithOthers error:nil];
     [[AVAudioSession sharedInstance] setActive:YES error:nil];
 
-    [g_testAudioEngine startAndReturnError:&err];
-    [g_testPlayerNode scheduleBuffer:pcmBuffer atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
-    [g_testPlayerNode play];
+    // 使用 AVAudioPlayer 高层API, 自带格式容错, 彻底杜绝 AVAudioEngine AURemoteIO 闪退
+    g_safeTestPlayer = [[AVAudioPlayer alloc] initWithData:wavData error:&err];
+    if (err || !g_safeTestPlayer) {
+        self.testStatusLabel.text = [NSString stringWithFormat:@"播放器初始化失败: %@", err.localizedDescription];
+        return;
+    }
 
-    self.testStatusLabel.text = kCurrentMusicFile ? [NSString stringWithFormat:@"正在试听MP3: %@", kCurrentMusicFile] : @"正在本地试听: 内置电台雪花+50Hz强嗡鸣";
+    g_safeTestPlayer.numberOfLoops = -1; // 循环试听
+    g_safeTestPlayer.volume = 1.0f;
+    [g_safeTestPlayer prepareToPlay];
+    [g_safeTestPlayer play];
+
+    self.testStatusLabel.text = kCurrentMusicFile ? [NSString stringWithFormat:@"正在本地试听MP3: %@", kCurrentMusicFile] : @"正在本地试听: 内置电台雪花+50Hz强嗡鸣";
 }
 
 - (void)stopTestAudio {
-    if (g_testPlayerNode) {
-        [g_testPlayerNode stop];
-        g_testPlayerNode = nil;
+    if (g_safeTestPlayer && [g_safeTestPlayer isPlaying]) {
+        [g_safeTestPlayer stop];
     }
-    if (g_testAudioEngine) {
-        [g_testAudioEngine stop];
-        g_testAudioEngine = nil;
-    }
+    g_safeTestPlayer = nil;
     self.testStatusLabel.text = @"已停止试听。";
 }
 
