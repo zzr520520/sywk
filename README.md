@@ -1,59 +1,63 @@
-# FightVoicePro v4.0.0 - 声控物语搏击音效插件
+# FightVoicePro v5.0.0 - 声控物语搏击音效插件
 
-专用于声控物语的 Zego 原生上行推流注入搏击音效插件（Tweak）。
+专用于声控物语的 Zego 原生推流 + 伴奏混音双轨注入搏击音效插件（Tweak）。
 
-## v4.0.0 架构回归 — Zego 原生上行推流
+## v5.0.0 终极闭环 — 伴奏推流通道硬绑定
 
-### 回溯分析：为什么第二、三版能生效
+### 核心问题定位
 
-第二、三版直接作用于 **ZegoLiveRoomApi 的上行推流管线**，通过：
-1. `setCaptureVolume:` 设置 500/1000/1500 极限增益
-2. 10 段 EQ 全频段过载增益（最高 +24dB）
-3. 彻底关闭 3A（AEC/AGC/ANS），防止声音被系统压制
+v4.0.0 的 `ZegoMediaPlayer` 用 `[[cls alloc] init]` 创建播放器，但没有传入 `playerType:0`（伴奏混音类型）或关联主推流通道。SDK 内部将其当成了独立的本地播放器，声音根本没有打包进 WebRTC/Opus 的音频帧。
 
-这种做法直接指挥 ZEGO 引擎对采集到的所有音频进行硬件放大和全频段爆音编码，再打包发给房间所有人。
+### v5.0.0 修复方案
 
-### 为什么 v2.8~v3.0 的底层 C Hook 失败
+1. **initWithPlayerType:0** — 显式创建伴奏混音播放器，关联主推流通道
+2. **setProcessType:0** — 设置伴奏推流混音模式
+3. **setAudioStreamType:2** — 混入上行推流 + 本地监听
+4. **内置雪花+50Hz嗡鸣 WAV 沙盒固化** — App 启动时自动将 PCM 数据封装为标准 WAV 写入 Documents/FightEffects/
+5. **constructor 即时初始化** — 动态库加载即生成 PCM + 写入 WAV 文件
+6. **stopPublishing hook** — 停止推流时同步停止效果播放器
 
-v2.8~v3.0 改去 Hook `AudioUnitRender`、`AudioUnitSetProperty` 和 `AudioConverterFillComplexBuffer`，这些底层操作只影响了本地播放管道或者没有握手成功，导致上层 SDK 的推流增益完全失效——**对方全聋，只有自己能听到**。
+### 与历史版本对比
 
-### v4.0.0 终极方案
-
-彻底剔除所有不可靠的底层 C Hook，**全面回归第二版/第三版最稳定的 Zego 原生推流注入链路**：
-
-| 版本 | 方案 | 效果 |
+| 版本 | 方案 | 问题 |
 |------|------|------|
-| v2.3~v2.7 | setAudioAuxData + PCM 混音 | 部分生效 |
-| v2.8~v2.9 | AudioUnitRender + AudioConverter Hook | 被SDK旁路，对方听不到 |
-| v3.0 | AudioUnitSetProperty 回调包装 | 底层操作不可靠 |
-| **v4.0.0** | **Zego 原生推流 API** | **对方 100% 必收到** |
+| v4.0.0 | ZegoMediaPlayer [[alloc] init] | 未关联推流通道，声音不进推流帧 |
+| **v5.0.0** | **initWithPlayerType:0 + setProcessType:0** | **伴奏混音硬绑定推流通道** |
 
-### 核心技术实现
+### 双轨推流架构
 
-1. **直接对接 ZEGO 上行推流核心**：不再走任何有风险的底层 C Hook，而是直接控制 `ZegoLiveRoomApi` 的推流通道参数，推流编码器将直接把经过增益与 EQ 塑形的音频流发送到服务端
+```
+┌─ 麦克风轨 ─────────────────────────────┐
+│ setCaptureVolume: 500/1000/1500        │
+│ 10段EQ 极限过载 (+24dB)                │
+│ 彻底关闭 3A (AGC/ANS/AEC)              │
+│ → ZegoLiveRoomApi 上行推流编码器       │
+└──────────────────────────────────────── ┘
 
-2. **0.8 秒高频保活线程**：无论 App 内部在上麦后如何重置麦克风参数，定时器会在毫秒级重新压入 500/1000/1500 增益 + 关闭 3A + 10 段过载 EQ，保证全房间收到的声音始终处于过载状态
-
-3. **三档搏击模式**：
-   - 新清晰搏击：500 音量 + 清晰咬字 EQ 曲线
-   - 旧清晰搏击：1000 音量 + 电台撕拉 EQ 曲线
-   - 超级战斗：1500 音量 + 全频段 +24dB 极限过载轰炸
-
-4. **ZegoMediaPlayer 音乐推流**：使用 `setAudioStreamType:2` 混入上行推流 + 本地监听，标准 SDK 接口确保音乐也能被全房间听到
-
-5. **彻底关闭 3A**：AGC / ANS / AEC + TransientNoiseSuppress 全部禁用，防止系统压制声音
+┌─ 伴奏效果轨 ───────────────────────────┐
+│ ZegoMediaPlayer initWithPlayerType:0   │
+│ setProcessType:0 (伴奏推流混音)        │
+│ setAudioStreamType:2 (推流+本地)       │
+│ setLoopCount:-1 (循环)                 │
+│ setPublishVolume:75/100                │
+│ → 内置雪花+50Hz嗡鸣 WAV 混入推流       │
+└──────────────────────────────────────── ┘
+```
 
 ## 功能特性
 
 - **Zego 原生上行推流** - setCaptureVolume + 10 段 EQ 极限过载
+- **伴奏混音推流** - initWithPlayerType:0 + setProcessType:0 + setAudioStreamType:2
+- **内置雪花+50Hz嗡鸣** - PCM 硬编码 + WAV 沙盒固化 + constructor 即时初始化
 - **0.8s 保活守护线程** - dispatch_source 高频刷新 DSP 参数
 - **三档爆音模式** - 500 / 1000 / 1500 增益
-- **ZegoMediaPlayer 音乐推流** - setAudioStreamType:2 混入推流
-- **多重强制开麦** - 三层拦截（SKAudioZegoManager + SKMicrophonePermissionManager + ZegoLiveRoomApi）
-- **强制永久关闭 3A** - AGC / ANS / AEC / TransientNoiseSuppress 全部禁用
+- **本地试听测试** - AVAudioPlayer + 强制扬声器外放
+- **多重强制开麦** - 三层拦截
+- **强制永久关闭 3A** - AGC / ANS / AEC / TransientNoiseSuppress
+- **stopPublishing 同步停止** - 防止效果播放器残留
 - **悬浮控制面板** - 双指双击调出，可拖拽
 - **iOS 13+ 兼容** - UIWindowScene 适配
-- **手势冲突防护** - shouldReceiveTouch 去重
+- **手势冲突防护** - shouldReceiveTouch 去重 + 手势去重
 
 ## 使用方法
 
@@ -62,7 +66,7 @@ v2.8~v3.0 改去 Hook `AudioUnitRender`、`AudioUnitSetProperty` 和 `AudioConve
 3. **功能 Tab**：开启/关闭搏击音效模式（新清晰/旧清晰/超级战斗）
 4. **调试 Tab**：调节各档位音量（100~3000）和人声权重
 5. **音乐 Tab**：导入 MP3/WAV/M4A → 点击「上麦发」推流
-6. **设置 Tab**：查看音频推流状态监控
+6. **设置 Tab**：本地试听内置雪花音效 + 查看推流状态
 
 ## 构建
 
@@ -73,4 +77,4 @@ make package FINALPACKAGE=1
 
 ## 依赖框架
 
-- UIKit / Foundation / AVFoundation / CoreGraphics
+- UIKit / Foundation / AVFoundation / CoreGraphics / CoreMedia

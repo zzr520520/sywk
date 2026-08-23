@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 4.0.0
+Version: 5.0.0
 Architecture: iphoneos-arm64
-Description: Zego原生上行推流+setCaptureVolume(500/1000/1500)+10段EQ极限过载(+24dB)+彻底关闭3A(AGC/ANS/AEC)+0.8s保活线程+ZegoMediaPlayer音乐推流+对方100%必收到
+Description: Zego原生推流+initWithPlayerType:0伴奏混音+setProcessType:0推流模式+setAudioStreamType:2混入推流+内置雪花50Hz嗡鸣WAV沙盒固化+setCaptureVolume(500/1000/1500)+10段EQ极限过载+关闭3A+0.8s保活+本地试听+对方100%必收到
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks
