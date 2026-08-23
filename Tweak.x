@@ -1,9 +1,9 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
-#import <AVFoundation/AVFoundation.h>
-#import <CoreMedia/CoreMedia.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreAudio/CoreAudioTypes.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #import <math.h>
 #import <stdlib.h>
 #import <pthread.h>
@@ -25,52 +25,148 @@ static float kSuperFightGain = 1500.0f;
 static float kVoiceGainRatio = 1.0f;
 
 static NSString *kCurrentMusicFile = nil;
-static __weak id g_activeZegoApi = nil;
-static dispatch_source_t g_keepAliveTimer = nil;
 
-// 线程安全互斥锁与动态导入 PCM 内存池
+// 线程安全互斥锁与 PCM 内存池
 static pthread_mutex_t g_pcmMutex = PTHREAD_MUTEX_INITIALIZER;
 static int16_t *g_customPcmBuffer = NULL;
 static size_t g_customPcmSize = 0;
 static size_t g_customPcmOffset = 0;
 
-// 内置默认 PCM 环形缓冲区
 #define EMBEDDED_PCM_LEN 44100
 static int16_t g_embeddedPcmBuffer[EMBEDDED_PCM_LEN];
 static size_t g_embeddedPcmOffset = 0;
 
-// 本地试听播放器
 static AVAudioPlayer *g_safeTestPlayer = nil;
 
-@interface NSObject (ZegoStandardDeclarations)
-- (bool)setCaptureVolume:(int)volume;
-- (bool)enableAGC:(bool)enable;
-- (bool)enableNoiseSuppress:(bool)enable;
-- (bool)setNoiseSuppressMode:(int)mode;
-- (bool)enableTransientNoiseSuppress:(bool)enable;
-- (bool)enableAEC:(bool)enable;
-- (bool)enableMic:(bool)enable;
-- (bool)setAudioEqualizerGain:(float)gain index:(int)index;
-- (void)enableAux:(bool)enable;
-- (void)setAudioCaptureShiftOnMix:(bool)enable;
-- (void)setAudioAuxDelegate:(id)delegate;
-@end
+// ---------------------- 核心混音算法（统一复用） ----------------------
+static inline void MixNoiseIntoAudioBuffer(AudioBufferList *ioData) {
+    if (!ioData || kCurrentFightMode == FightMode_Normal) return;
 
-// ---------------------- 前置函数声明 ----------------------
-static void InitEmbeddedPCMData(void);
-static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int sampleRate, int channels);
-static void LoadMP3ToPCM(NSString *filePath);
-static void ApplyPreciseRadioFightDSP(id zegoApi);
-static void StartKeepAliveService(void);
+    float gainMultiplier = 1.0f;
+    float baseVolMultiplier = (kNewFightGain / 100.0f) * kVoiceGainRatio;
 
-// ---------------------- CoreAudio 底层 Hook ----------------------
-// 原始 AudioUnitRender 函数指针
+    if (kCurrentFightMode == FightMode_Old) {
+        gainMultiplier = 1.6f;
+        baseVolMultiplier = (kOldFightGain / 100.0f) * kVoiceGainRatio;
+    } else if (kCurrentFightMode == FightMode_Super) {
+        gainMultiplier = 2.4f;
+        baseVolMultiplier = (kSuperFightGain / 100.0f) * kVoiceGainRatio;
+    }
+
+    pthread_mutex_lock(&g_pcmMutex);
+    for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+        AudioBuffer buf = ioData->mBuffers[b];
+        if (buf.mData == NULL || buf.mDataByteSize == 0) continue;
+
+        int16_t *samples = (int16_t *)buf.mData;
+        UInt32 sampleCount = buf.mDataByteSize / sizeof(int16_t);
+
+        for (UInt32 i = 0; i < sampleCount; i++) {
+            int16_t bgSample = 0;
+            if (g_customPcmBuffer && g_customPcmSize > 0) {
+                bgSample = g_customPcmBuffer[g_customPcmOffset++];
+                if (g_customPcmOffset >= g_customPcmSize) g_customPcmOffset = 0;
+            } else {
+                bgSample = g_embeddedPcmBuffer[g_embeddedPcmOffset++];
+                if (g_embeddedPcmOffset >= EMBEDDED_PCM_LEN) g_embeddedPcmOffset = 0;
+            }
+
+            // 人声放大 + 强行注入电视雪花与 50Hz 嗡鸣
+            float voice = (float)samples[i] * baseVolMultiplier;
+            float noise = (float)bgSample * gainMultiplier;
+            float mixed = voice + noise;
+
+            if (mixed > 32767.0f) mixed = 32767.0f;
+            if (mixed < -32768.0f) mixed = -32768.0f;
+
+            samples[i] = (int16_t)mixed;
+        }
+    }
+    pthread_mutex_unlock(&g_pcmMutex);
+}
+
+// ---------------------- 核心 Hook 1: AudioUnitRender (硬件录音渲染拦截) ----------------------
 static OSStatus (*orig_AudioUnitRender)(AudioUnit inUnit,
-                                         AudioUnitRenderActionFlags *ioActionFlags,
-                                         const AudioTimeStamp *inTimeStamp,
-                                         UInt32 inOutputBusNumber,
-                                         UInt32 inNumberFrames,
-                                         AudioBufferList *ioData);
+                                        AudioUnitRenderActionFlags *ioActionFlags,
+                                        const AudioTimeStamp *inTimeStamp,
+                                        UInt32 inOutputBusNumber,
+                                        UInt32 inNumberFrames,
+                                        AudioBufferList *ioData);
+
+static OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
+                                       AudioUnitRenderActionFlags *ioActionFlags,
+                                       const AudioTimeStamp *inTimeStamp,
+                                       UInt32 inOutputBusNumber,
+                                       UInt32 inNumberFrames,
+                                       AudioBufferList *ioData) {
+    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
+                                           inOutputBusNumber, inNumberFrames, ioData);
+    // 对所有输出缓冲统一注入混音（Bus 0 播放 / Bus 1 录音 全部拦截）
+    if (status == noErr && ioData != NULL) {
+        MixNoiseIntoAudioBuffer(ioData);
+    }
+    return status;
+}
+
+// ---------------------- 核心 Hook 2: AudioConverterFillComplexBuffer (格式转换拦截) ----------------------
+// ZEGO 底层会用 AudioConverter 把 44.1k/48k 转成 Opus/AAC 编码需要的格式
+// 在此处二次混音，确保编码前必带杂音，万无一失
+static OSStatus (*orig_AudioConverterFillComplexBuffer)(AudioConverterRef inAudioConverter,
+                                                        AudioConverterComplexInputDataProc inInputDataProc,
+                                                        void *inInputDataProcUserData,
+                                                        UInt32 *ioOutputDataPacketSize,
+                                                        AudioBufferList *outOutputData,
+                                                        AudioStreamPacketDescription *outPacketDescription);
+
+static OSStatus hooked_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter,
+                                                       AudioConverterComplexInputDataProc inInputDataProc,
+                                                       void *inInputDataProcUserData,
+                                                       UInt32 *ioOutputDataPacketSize,
+                                                       AudioBufferList *outOutputData,
+                                                       AudioStreamPacketDescription *outPacketDescription) {
+    OSStatus status = orig_AudioConverterFillComplexBuffer(inAudioConverter, inInputDataProc,
+                                                           inInputDataProcUserData, ioOutputDataPacketSize,
+                                                           outOutputData, outPacketDescription);
+    // 格式转换后二次注入，确保 Opus/AAC 编码前 PCM 数据已带雪花嗡鸣
+    if (status == noErr && outOutputData != NULL) {
+        MixNoiseIntoAudioBuffer(outOutputData);
+    }
+    return status;
+}
+
+// ---------------------- 电视雪花 + 50Hz 强嗡鸣初始化 ----------------------
+static void InitEmbeddedPCMData() {
+    double humPhase = 0.0;
+    double tvScanPhase = 0.0;
+    double pulsePhase = 0.0;
+
+    for (int i = 0; i < EMBEDDED_PCM_LEN; i++) {
+        // 1. 白噪声 (-14dB)
+        float whiteNoise = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f);
+        float noiseAmp = 32767.0f * powf(10.0f, -14.0f / 20.0f);
+
+        // 2. 50Hz 工频强嗡鸣 (-12dB)
+        humPhase += 50.0 / 44100.0;
+        if (humPhase >= 1.0) humPhase -= 1.0;
+        float hum = sinf(humPhase * 2.0 * M_PI) * (32767.0f * powf(10.0f, -12.0f / 20.0f));
+
+        // 3. 15.625kHz 高频载波
+        tvScanPhase += 15625.0 / 44100.0;
+        if (tvScanPhase >= 1.0) tvScanPhase -= 1.0;
+        float scan = sinf(tvScanPhase * 2.0 * M_PI) * (noiseAmp * 0.25f);
+
+        // 4. 18Hz 切音撕拉
+        pulsePhase += 18.0 / 44100.0;
+        if (pulsePhase >= 1.0) pulsePhase -= 1.0;
+        float pulse = (sinf(pulsePhase * 2.0 * M_PI) > -0.15f) ? 1.0f : 0.35f;
+
+        float sample = (whiteNoise * noiseAmp * pulse) + hum + scan;
+        if (sample > 32767.0f) sample = 32767.0f;
+        if (sample < -32768.0f) sample = -32768.0f;
+
+        g_embeddedPcmBuffer[i] = (int16_t)sample;
+    }
+}
 
 // ---------------------- 路径辅助 ----------------------
 static NSString *GetSafeDir(NSString *subDir) {
@@ -105,100 +201,7 @@ static UIWindow *GetKeyWindow() {
     return keyWindow;
 }
 
-// ---------------------- 启动初始化内置 1秒 电视雪花+50Hz强嗡鸣数据 ----------------------
-static void InitEmbeddedPCMData() {
-    double humPhase = 0.0;
-    double tvScanPhase = 0.0;
-    double pulsePhase = 0.0;
-
-    for (int i = 0; i < EMBEDDED_PCM_LEN; i++) {
-        // 1. 白噪声基底 (-14dB)
-        float whiteNoise = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f);
-        float noiseAmp = 32767.0f * powf(10.0f, -14.0f / 20.0f);
-
-        // 2. 50Hz 工频场电强嗡鸣 (-12dB)
-        humPhase += 50.0 / 44100.0;
-        if (humPhase >= 1.0) humPhase -= 1.0;
-        float hum = sinf(humPhase * 2.0 * M_PI) * (32767.0f * powf(10.0f, -12.0f / 20.0f));
-
-        // 3. 15.625kHz 显像管高频载波
-        tvScanPhase += 15625.0 / 44100.0;
-        if (tvScanPhase >= 1.0) tvScanPhase -= 1.0;
-        float scan = sinf(tvScanPhase * 2.0 * M_PI) * (noiseAmp * 0.25f);
-
-        // 4. 18Hz 切音撕拉调制
-        pulsePhase += 18.0 / 44100.0;
-        if (pulsePhase >= 1.0) pulsePhase -= 1.0;
-        float pulse = (sinf(pulsePhase * 2.0 * M_PI) > -0.15) ? 1.0f : 0.35f;
-
-        float sample = (whiteNoise * noiseAmp * pulse) + hum + scan;
-        if (sample > 32767.0f) sample = 32767.0f;
-        if (sample < -32768.0f) sample = -32768.0f;
-
-        g_embeddedPcmBuffer[i] = (int16_t)sample;
-    }
-}
-
-// ---------------------- 标准 Pull 模式 Aux 数据提供代理 ----------------------
-// 引擎每隔 20ms 向代理请求一次数据, 代理直接将内存 PCM 拷贝至 SDK 提供的目标缓冲区
-// 完全不丢帧、不卡顿, 由 SDK 负责与麦克风通道混流并推向远端
-@interface ZegoAudioAuxProvider : NSObject
-+ (instancetype)shared;
-@end
-
-@implementation ZegoAudioAuxProvider
-
-+ (instancetype)shared {
-    static ZegoAudioAuxProvider *instance;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[ZegoAudioAuxProvider alloc] init];
-    });
-    return instance;
-}
-
-// Zego 官方标准 Aux Pull 数据索取回调
-- (void)onAudioAuxData:(void *)data dataLen:(int *)dataLen sampleRate:(int *)sampleRate channelCount:(int *)channelCount {
-    if (!data || !dataLen || *dataLen <= 0 || kCurrentFightMode == FightMode_Normal) {
-        if (dataLen) *dataLen = 0;
-        return;
-    }
-
-    *sampleRate = 44100;
-    *channelCount = 1;
-
-    int requiredSamples = *dataLen / (int)sizeof(int16_t);
-    int16_t *targetBuffer = (int16_t *)data;
-
-    float gainMultiplier = 1.0f;
-    if (kCurrentFightMode == FightMode_Old) gainMultiplier = 1.6f;
-    if (kCurrentFightMode == FightMode_Super) gainMultiplier = 2.4f;
-
-    pthread_mutex_lock(&g_pcmMutex);
-    if (g_customPcmBuffer && g_customPcmSize > 0) {
-        for (int i = 0; i < requiredSamples; i++) {
-            int16_t s = g_customPcmBuffer[g_customPcmOffset++];
-            if (g_customPcmOffset >= g_customPcmSize) g_customPcmOffset = 0;
-            targetBuffer[i] = (int16_t)(s * gainMultiplier);
-        }
-    } else {
-        for (int i = 0; i < requiredSamples; i++) {
-            int16_t s = g_embeddedPcmBuffer[g_embeddedPcmOffset++];
-            if (g_embeddedPcmOffset >= EMBEDDED_PCM_LEN) g_embeddedPcmOffset = 0;
-            targetBuffer[i] = (int16_t)(s * gainMultiplier);
-        }
-    }
-    pthread_mutex_unlock(&g_pcmMutex);
-}
-
-// 兼容部分 SDK 版本带 channelIndex 的签名
-- (void)onAudioAuxData:(void *)data dataLen:(int *)dataLen sampleRate:(int *)sampleRate channelCount:(int *)channelCount channelIndex:(int)channelIndex {
-    [self onAudioAuxData:data dataLen:dataLen sampleRate:sampleRate channelCount:channelCount];
-}
-
-@end
-
-// ---------------------- 内存 PCM 数据封装为标准 WAV NSData ----------------------
+// ---------------------- 内存封装标准 WAV 数据 ----------------------
 static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int sampleRate, int channels) {
     if (!pcmData || sampleCount == 0) return nil;
 
@@ -217,7 +220,7 @@ static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int 
     [wavData appendBytes:"fmt " length:4];
 
     uint32_t subchunk1Size = 16;
-    uint16_t audioFormat = 1; // PCM
+    uint16_t audioFormat = 1;
     [wavData appendBytes:&subchunk1Size length:4];
     [wavData appendBytes:&audioFormat length:2];
     [wavData appendBytes:&numChannels length:2];
@@ -233,7 +236,7 @@ static NSData *WrapPCMToWavData(const int16_t *pcmData, size_t sampleCount, int 
     return wavData;
 }
 
-// ---------------------- 线程安全 MP3 动态导入解码 ----------------------
+// ---------------------- 线程安全 MP3 解码 ----------------------
 static void LoadMP3ToPCM(NSString *filePath) {
     if (!filePath || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) return;
 
@@ -266,13 +269,11 @@ static void LoadMP3ToPCM(NSString *filePath) {
         if (sampleBuffer) {
             CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sampleBuffer);
             size_t len = CMBlockBufferGetDataLength(block);
-            if (len > 0) {
-                char *buf = (char *)malloc(len);
-                if (buf) {
-                    CMBlockBufferCopyDataBytes(block, 0, len, buf);
-                    [pcmData appendBytes:buf length:len];
-                    free(buf);
-                }
+            char *buf = (char *)malloc(len);
+            if (buf) {
+                CMBlockBufferCopyDataBytes(block, 0, len, buf);
+                [pcmData appendBytes:buf length:len];
+                free(buf);
             }
             CFRelease(sampleBuffer);
         } else {
@@ -280,7 +281,6 @@ static void LoadMP3ToPCM(NSString *filePath) {
         }
     }
 
-    // 锁外 malloc + memcpy
     if (pcmData.length > 0) {
         size_t newSize = pcmData.length / sizeof(int16_t);
         int16_t *newBuf = (int16_t *)malloc(pcmData.length);
@@ -301,68 +301,7 @@ static void LoadMP3ToPCM(NSString *filePath) {
     }
 }
 
-// ---------------------- 核心调音、Aux 代理绑定与 3A 锁定 ----------------------
-static void ApplyPreciseRadioFightDSP(id zegoApi) {
-    if (!zegoApi) return;
-
-    if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) {
-        [zegoApi enableMic:YES];
-    }
-
-    if (kCurrentFightMode == FightMode_Normal) {
-        if ([zegoApi respondsToSelector:@selector(enableAux:)]) [zegoApi enableAux:NO];
-        if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
-        if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
-        if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
-        if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
-        if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-            for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
-        }
-        return;
-    }
-
-    // 1. 注册 Aux Pull 代理并激活混音
-    if ([zegoApi respondsToSelector:@selector(setAudioAuxDelegate:)]) {
-        [zegoApi setAudioAuxDelegate:[ZegoAudioAuxProvider shared]];
-    }
-    if ([zegoApi respondsToSelector:@selector(enableAux:)]) {
-        [zegoApi enableAux:YES];
-    }
-    if ([zegoApi respondsToSelector:@selector(setAudioCaptureShiftOnMix:)]) {
-        [zegoApi setAudioCaptureShiftOnMix:YES];
-    }
-
-    // 2. 彻底关闭 3A
-    if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
-    if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
-    if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
-    if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
-
-    // 3. 麦克风增益与全频段放行
-    float baseGain = kNewFightGain;
-    if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
-    if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-    int finalVolume = (int)(baseGain * kVoiceGainRatio);
-
-    if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) {
-        [zegoApi setCaptureVolume:finalVolume];
-    }
-
-    if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-        [zegoApi setAudioEqualizerGain:8.0f index:0];   // 31Hz
-        [zegoApi setAudioEqualizerGain:10.0f index:1];  // 62Hz
-        [zegoApi setAudioEqualizerGain:6.0f index:2];   // 125Hz
-        [zegoApi setAudioEqualizerGain:2.0f index:3];   // 250Hz
-        [zegoApi setAudioEqualizerGain:0.0f index:4];   // 500Hz
-        [zegoApi setAudioEqualizerGain:8.0f index:5];   // 1kHz
-        [zegoApi setAudioEqualizerGain:12.0f index:6];  // 2kHz
-        [zegoApi setAudioEqualizerGain:15.0f index:7];  // 4kHz
-        [zegoApi setAudioEqualizerGain:10.0f index:8];  // 8kHz
-        [zegoApi setAudioEqualizerGain:8.0f index:9];   // 16kHz
-    }
-}
-
-// ---------------------- Hook 业务与底层 ----------------------
+// ---------------------- Hook 业务与麦克风状态 ----------------------
 %hook SKAudioZegoManager
 
 - (void)enableMic:(BOOL)enable {
@@ -371,9 +310,6 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
     } else {
         %orig(enable);
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(g_activeZegoApi);
-    });
 }
 
 - (BOOL)micEnabled {
@@ -394,68 +330,28 @@ static void ApplyPreciseRadioFightDSP(id zegoApi) {
 
 %hook ZegoLiveRoomApi
 
-- (id)init {
-    id inst = %orig;
-    g_activeZegoApi = inst;
-    return inst;
-}
-
 - (bool)enableMic:(bool)enable {
-    g_activeZegoApi = self;
     if (kForceOpenMic) return %orig(YES);
     return %orig(enable);
 }
 
-- (bool)setCaptureVolume:(int)volume {
-    g_activeZegoApi = self;
-    if (kCurrentFightMode != FightMode_Normal) {
-        float baseGain = kNewFightGain;
-        if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
-        if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-        return %orig((int)(baseGain * kVoiceGainRatio));
-    }
-    return %orig(volume);
+// 彻底关死 3A，防止混入的雪花音被当做噪音消除
+- (bool)enableAGC:(bool)enable {
+    if (kCurrentFightMode != FightMode_Normal) return %orig(NO);
+    return %orig(enable);
 }
 
-- (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo {
-    g_activeZegoApi = self;
-    bool res = %orig;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(weakSelf);
-    });
-    return res;
+- (bool)enableNoiseSuppress:(bool)enable {
+    if (kCurrentFightMode != FightMode_Normal) return %orig(NO);
+    return %orig(enable);
 }
 
-- (bool)startPublishing2:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo params:(NSString *)params channelIndex:(int)channelIndex {
-    g_activeZegoApi = self;
-    bool res = %orig;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyPreciseRadioFightDSP(weakSelf);
-    });
-    return res;
+- (bool)enableAEC:(bool)enable {
+    if (kCurrentFightMode != FightMode_Normal) return %orig(NO);
+    return %orig(enable);
 }
 
 %end
-
-// ---------------------- 保活线程 ----------------------
-static void StartKeepAliveService() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
-        g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-        dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
-        dispatch_source_set_event_handler(g_keepAliveTimer, ^{
-            if (g_activeZegoApi && kCurrentFightMode != FightMode_Normal) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    ApplyPreciseRadioFightDSP(g_activeZegoApi);
-                });
-            }
-        });
-        dispatch_resume(g_keepAliveTimer);
-    });
-}
 
 // ---------------------- 音乐管理视图 ----------------------
 @interface MusicManagerView : UIView <UITableViewDelegate, UITableViewDataSource, UIDocumentPickerDelegate>
@@ -465,7 +361,6 @@ static void StartKeepAliveService() {
 @end
 
 @implementation MusicManagerView
-
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
@@ -515,7 +410,6 @@ static void StartKeepAliveService() {
         self.tableView.rowHeight = 36;
         self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
         [self addSubview:self.tableView];
-
         [self refreshFileList];
     }
     return self;
@@ -551,14 +445,12 @@ static void StartKeepAliveService() {
     [self refreshFileList];
 }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.musicFiles.count;
-}
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return self.musicFiles.count; }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"MusicItemCell"];
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"MCell"];
     if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"MusicItemCell"];
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"MCell"];
         cell.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
         cell.layer.cornerRadius = 6;
         cell.textLabel.textColor = [UIColor whiteColor];
@@ -604,19 +496,19 @@ static void StartKeepAliveService() {
     return cell;
 }
 
-- (void)publishTrack:(UIButton *)btn {
-    if (btn.tag >= (NSInteger)self.musicFiles.count) return;
-    kCurrentMusicFile = self.musicFiles[btn.tag];
+- (void)publishTrack:(UIButton *)b {
+    if (b.tag >= (NSInteger)self.musicFiles.count) return;
+    kCurrentMusicFile = self.musicFiles[b.tag];
     self.statusLabel.text = [NSString stringWithFormat:@"推流中: %@", kCurrentMusicFile];
     LoadMP3ToPCM([GetSafeDir(@"FightMusic") stringByAppendingPathComponent:kCurrentMusicFile]);
 }
 
-- (void)deleteTrack:(UIButton *)btn {
-    if (btn.tag >= (NSInteger)self.musicFiles.count) return;
-    NSString *f = self.musicFiles[btn.tag];
+- (void)deleteTrack:(UIButton *)b {
+    if (b.tag >= (NSInteger)self.musicFiles.count) return;
+    NSString *f = self.musicFiles[b.tag];
     [[NSFileManager defaultManager] removeItemAtPath:[GetSafeDir(@"FightMusic") stringByAppendingPathComponent:f] error:nil];
     if ([kCurrentMusicFile isEqualToString:f]) [self stopPlayMusic];
-    [self.musicFiles removeObjectAtIndex:btn.tag];
+    [self.musicFiles removeObjectAtIndex:b.tag];
     [self.tableView reloadData];
 }
 
@@ -632,7 +524,6 @@ static void StartKeepAliveService() {
     if (bufToFree) {
         free(bufToFree);
     }
-
     kCurrentMusicFile = nil;
     self.statusLabel.text = @"默认内置雪花嗡鸣";
 }
@@ -652,10 +543,9 @@ static void StartKeepAliveService() {
     kCurrentMusicFile = nil;
     self.statusLabel.text = @"已切回内置雪花";
 }
-
 @end
 
-// ---------------------- 设置页 (强制扬声器外放 + 确保内存就绪) ----------------------
+// ---------------------- 设置页 ----------------------
 @interface SettingManagerView : UIView
 @property (nonatomic, strong) UILabel *testStatusLabel;
 @end
@@ -666,8 +556,6 @@ static void StartKeepAliveService() {
     self = [super initWithFrame:frame];
     if (self) {
         self.backgroundColor = [UIColor clearColor];
-
-        // 打开设置页时再次确保内置 PCM 有数据
         InitEmbeddedPCMData();
 
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, frame.size.width - 24, 22)];
@@ -697,7 +585,7 @@ static void StartKeepAliveService() {
         [self addSubview:stopTestBtn];
 
         self.testStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 85, frame.size.width - 24, 48)];
-        self.testStatusLabel.text = @"内置雪花与50Hz强嗡鸣已就绪。点击「开始试听」将在耳机/外放扬声器播放。";
+        self.testStatusLabel.text = @"内置雪花与50Hz强嗡鸣已就绪。点击「开始试听」将在耳机/外放本地播放。";
         self.testStatusLabel.numberOfLines = 0;
         self.testStatusLabel.font = [UIFont systemFontOfSize:10.5];
         self.testStatusLabel.textColor = [UIColor whiteColor];
@@ -706,15 +594,16 @@ static void StartKeepAliveService() {
         // 版本信息
         CGFloat y = 143;
         NSArray *info = @[
-            @"FightVoicePro v2.8.0",
+            @"FightVoicePro v2.9.0",
             @"",
-            @"推流模式: CoreAudio 底层 Hook",
-            @"  MSHookFunction(AudioUnitRender)",
-            @"  硬件级 PCM 混音, 绕过SDK",
-            @"  + Pull 代理双保险",
+            @"底层混音: 双层 CoreAudio Hook",
+            @"  1. AudioUnitRender (硬件录音)",
+            @"  2. AudioConverterFillComplexBuffer",
+            @"     (格式转换二次注入, 防SDK旁路)",
+            @"  MixNoiseIntoAudioBuffer 统一算法",
             @"",
             @"内置PCM: 纯内存硬编码合成",
-            @"  constructor注入即生成+安装Hook",
+            @"  constructor注入即生成+安装双Hook",
             @"  白噪声 -14dB + 50Hz嗡鸣 -12dB",
             @"  15625Hz行频 + 18Hz撕拉切音",
             @"",
@@ -723,16 +612,8 @@ static void StartKeepAliveService() {
             @"  强制外放 overrideOutputAudioPort",
             @"  Playback模式 + MixWithOthers",
             @"",
-            @"底层混音: 硬件级强制覆盖",
-            @"  AudioUnitRender 拦截后",
-            @"  人声×baseVol + 噪音×gain",
-            @"  硬削顶 [-32768, 32767]",
-            @"",
-            @"线程安全: pthread_mutex + Double-buffering",
             @"3A 状态: AGC/ANS/AEC 强制关闭",
-            @"EQ: 全频段直通 20Hz~20kHz",
-            @"保活: 0.8s 定时刷新 DSP",
-            @"",
+            @"线程安全: pthread_mutex",
             @"构建: GitHub Actions CI"
         ];
 
@@ -769,7 +650,6 @@ static void StartKeepAliveService() {
 
 - (void)startTestAudio {
     [self stopTestAudio];
-
     InitEmbeddedPCMData();
 
     pthread_mutex_lock(&g_pcmMutex);
@@ -801,7 +681,7 @@ static void StartKeepAliveService() {
     [g_safeTestPlayer prepareToPlay];
     [g_safeTestPlayer play];
 
-    self.testStatusLabel.text = kCurrentMusicFile ? [NSString stringWithFormat:@"正在试听MP3: %@", kCurrentMusicFile] : @"正在试听: 内置电台雪花+50Hz强嗡鸣 (大声播放中)";
+    self.testStatusLabel.text = kCurrentMusicFile ? [NSString stringWithFormat:@"正在试听MP3: %@", kCurrentMusicFile] : @"正在本地试听: 内置电台雪花+50Hz强嗡鸣";
 }
 
 - (void)stopTestAudio {
@@ -827,7 +707,6 @@ static void StartKeepAliveService() {
 @end
 
 @implementation BattleMasterHUD
-
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
@@ -923,7 +802,6 @@ static void StartKeepAliveService() {
         [row addSubview:sw];
 
         if (i == 0) { self.swForceMic = sw; [sw setOn:kForceOpenMic]; }
-        if (i == 1) { /* 屏蔽滋啦杂音 - 预留 */ }
         if (i == 2) { self.swNewFight = sw; [sw setOn:YES]; }
         if (i == 3) self.swOldFight = sw;
         if (i == 4) self.swSuperFight = sw;
@@ -951,48 +829,45 @@ static void StartKeepAliveService() {
     }
 }
 
-- (void)tabClicked:(UIButton *)btn {
-    self.funcPageView.hidden = (btn.tag != 200);
-    self.debugPageView.hidden = (btn.tag != 201);
-    self.musicPageView.hidden = (btn.tag != 202);
-    self.settingPageView.hidden = (btn.tag != 203);
-    if (btn.tag == 202) [self.musicPageView refreshFileList];
+- (void)tabClicked:(UIButton *)b {
+    self.funcPageView.hidden = (b.tag != 200);
+    self.debugPageView.hidden = (b.tag != 201);
+    self.musicPageView.hidden = (b.tag != 202);
+    self.settingPageView.hidden = (b.tag != 203);
+    if (b.tag == 202) [self.musicPageView refreshFileList];
 }
 
-- (void)onSliderChanged:(UISlider *)slider {
-    if (slider.tag == 500) kNewFightGain = slider.value;
-    if (slider.tag == 501) kOldFightGain = slider.value;
-    if (slider.tag == 502) kSuperFightGain = slider.value;
-    if (slider.tag == 503) kVoiceGainRatio = slider.value;
-    ApplyPreciseRadioFightDSP(g_activeZegoApi);
+- (void)onSliderChanged:(UISlider *)s {
+    if (s.tag == 500) kNewFightGain = s.value;
+    if (s.tag == 501) kOldFightGain = s.value;
+    if (s.tag == 502) kSuperFightGain = s.value;
+    if (s.tag == 503) kVoiceGainRatio = s.value;
 }
 
-- (void)onFuncSwitch:(UISwitch *)sender {
-    if (sender == self.swForceMic) kForceOpenMic = sender.isOn;
-    if (sender == self.swNewFight) {
-        if (sender.isOn) { kCurrentFightMode = FightMode_New; [self.swOldFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
+- (void)onFuncSwitch:(UISwitch *)s {
+    if (s == self.swForceMic) kForceOpenMic = s.isOn;
+    if (s == self.swNewFight) {
+        if (s.isOn) { kCurrentFightMode = FightMode_New; [self.swOldFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
         else { kCurrentFightMode = FightMode_Normal; }
     }
-    if (sender == self.swOldFight) {
-        if (sender.isOn) { kCurrentFightMode = FightMode_Old; [self.swNewFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
+    if (s == self.swOldFight) {
+        if (s.isOn) { kCurrentFightMode = FightMode_Old; [self.swNewFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
         else { kCurrentFightMode = FightMode_Normal; }
     }
-    if (sender == self.swSuperFight) {
-        if (sender.isOn) { kCurrentFightMode = FightMode_Super; [self.swNewFight setOn:NO animated:YES]; [self.swOldFight setOn:NO animated:YES]; }
+    if (s == self.swSuperFight) {
+        if (s.isOn) { kCurrentFightMode = FightMode_Super; [self.swNewFight setOn:NO animated:YES]; [self.swOldFight setOn:NO animated:YES]; }
         else { kCurrentFightMode = FightMode_Normal; }
     }
-    ApplyPreciseRadioFightDSP(g_activeZegoApi);
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint translation = [pan translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
-    [pan setTranslation:CGPointZero inView:self.superview];
+- (void)handlePan:(UIPanGestureRecognizer *)p {
+    CGPoint t = [p translationInView:self.superview];
+    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
+    [p setTranslation:CGPointZero inView:self.superview];
 }
-
 @end
 
-// ---------------------- 双指双击手势 ----------------------
+// ---------------------- 双指双击手势与窗口 Hook ----------------------
 static BattleMasterHUD *g_hudInstance = nil;
 static NSTimeInterval g_lastTapStamp = 0;
 
@@ -1002,7 +877,6 @@ static NSTimeInterval g_lastTapStamp = 0;
 @end
 
 @implementation HUDGestureHandler
-
 + (instancetype)shared {
     static HUDGestureHandler *h;
     static dispatch_once_t onceToken;
@@ -1012,6 +886,7 @@ static NSTimeInterval g_lastTapStamp = 0;
 
 - (void)attachToWindow:(UIWindow *)window {
     if (!window) return;
+    // 去重：已存在双指双击手势则跳过
     for (UIGestureRecognizer *g in window.gestureRecognizers) {
         if ([g isKindOfClass:[UITapGestureRecognizer class]] && ((UITapGestureRecognizer *)g).numberOfTouchesRequired == 2) {
             return;
@@ -1025,9 +900,7 @@ static NSTimeInterval g_lastTapStamp = 0;
     [window addGestureRecognizer:tap];
 }
 
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g1 shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)g2 {
-    return YES;
-}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g1 shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)g2 { return YES; }
 
 - (void)handleTap:(UITapGestureRecognizer *)tap {
     if (tap.state != UIGestureRecognizerStateEnded) return;
@@ -1052,96 +925,31 @@ static NSTimeInterval g_lastTapStamp = 0;
         [UIView animateWithDuration:0.2 animations:^{ g_hudInstance.alpha = 0.0f; } completion:^(BOOL f) { g_hudInstance.hidden = YES; }];
     }
 }
-
 @end
 
-// ---------------------- 注入启动 (合并 UIWindow hook) ----------------------
 %hook UIWindow
-
 - (void)makeKeyAndVisible {
     %orig;
-    StartKeepAliveService();
     [[HUDGestureHandler shared] attachToWindow:self];
 }
-
 %end
 
-// ---------------------- CoreAudio 底层混音 Hook 实现 ----------------------
-// 无论上层 App 怎么封装、无论 SDK 用什么代理，只要手机麦克风开始录音，
-// 底层 PCM 内存就会被强制覆盖并混入雪花嗡鸣与 MP3，对方 100% 必定收到。
-static OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
-                                        AudioUnitRenderActionFlags *ioActionFlags,
-                                        const AudioTimeStamp *inTimeStamp,
-                                        UInt32 inOutputBusNumber,
-                                        UInt32 inNumberFrames,
-                                        AudioBufferList *ioData) {
-    // 1. 先调用原始函数拿到录音 PCM 数据
-    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
-                                           inOutputBusNumber, inNumberFrames, ioData);
-
-    // 2. 录音渲染成功且处于战斗模式时，在底层强制混入雪花嗡鸣
-    if (status == noErr && ioData != NULL && kCurrentFightMode != FightMode_Normal) {
-        // 根据战斗模式确定增益乘法器
-        float gainMultiplier = 1.0f;
-        float baseVolMultiplier = (kNewFightGain / 100.0f) * kVoiceGainRatio;
-
-        if (kCurrentFightMode == FightMode_Old) {
-            gainMultiplier = 1.6f;
-            baseVolMultiplier = (kOldFightGain / 100.0f) * kVoiceGainRatio;
-        } else if (kCurrentFightMode == FightMode_Super) {
-            gainMultiplier = 2.4f;
-            baseVolMultiplier = (kSuperFightGain / 100.0f) * kVoiceGainRatio;
-        }
-
-        pthread_mutex_lock(&g_pcmMutex);
-        // 遍历所有音频缓冲区（单声道/多声道均支持）
-        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-            AudioBuffer buffer = ioData->mBuffers[b];
-            if (buffer.mData == NULL || buffer.mDataByteSize == 0) continue;
-
-            int16_t *samples = (int16_t *)buffer.mData;
-            UInt32 sampleCount = buffer.mDataByteSize / sizeof(int16_t);
-
-            for (UInt32 i = 0; i < sampleCount; i++) {
-                // 从环形缓冲区取出背景噪音样本
-                int16_t bgSample = 0;
-                if (g_customPcmBuffer && g_customPcmSize > 0) {
-                    // 自定义 MP3 数据
-                    bgSample = g_customPcmBuffer[g_customPcmOffset++];
-                    if (g_customPcmOffset >= g_customPcmSize) g_customPcmOffset = 0;
-                } else {
-                    // 内置雪花嗡鸣数据
-                    bgSample = g_embeddedPcmBuffer[g_embeddedPcmOffset++];
-                    if (g_embeddedPcmOffset >= EMBEDDED_PCM_LEN) g_embeddedPcmOffset = 0;
-                }
-
-                // 强制在底层把录音数据与雪花嗡鸣混合并过载放大
-                float voice = (float)samples[i] * baseVolMultiplier;
-                float noise = (float)bgSample * gainMultiplier;
-                float mixed = voice + noise;
-
-                // 硬削顶防溢出爆裂
-                if (mixed > 32767.0f) mixed = 32767.0f;
-                if (mixed < -32768.0f) mixed = -32768.0f;
-
-                samples[i] = (int16_t)mixed;
-            }
-        }
-        pthread_mutex_unlock(&g_pcmMutex);
-    }
-
-    return status;
-}
-
-// ---------------------- 构造函数: 动态库加载即初始化 PCM 数据 + 安装底层 Hook ----------------------
+// ---------------------- 构造函数安装双层 CoreAudio 拦截 ----------------------
 __attribute__((constructor)) static void InitializeTweak() {
     // 1. 注入瞬间立即生成内置 PCM 雪花嗡鸣数据
     InitEmbeddedPCMData();
 
-    // 2. 动态挂钩 CoreAudio 系统底层渲染 C 函数
+    // 2. Hook 硬件录音渲染（AudioUnitRender）
     //    所有 iOS 音频框架最终都必须调用 AudioUnitRender
-    //    无论 ZEGO / WebRTC / AVFoundation，底层 PCM 必定被拦截
+    //    Bus 0 (输出) / Bus 1 (输入) 全部拦截并注入混音
     MSHookFunction((void *)AudioUnitRender,
                    (void *)hooked_AudioUnitRender,
                    (void **)&orig_AudioUnitRender);
+
+    // 3. Hook 系统音频格式转换（AudioConverterFillComplexBuffer）
+    //    ZEGO 等 SDK 会用 AudioConverter 在编码前做格式转换
+    //    在此处二次注入，确保 Opus/AAC 编码前 PCM 必带雪花嗡鸣
+    MSHookFunction((void *)AudioConverterFillComplexBuffer,
+                   (void *)hooked_AudioConverterFillComplexBuffer,
+                   (void **)&orig_AudioConverterFillComplexBuffer);
 }
