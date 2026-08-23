@@ -53,7 +53,8 @@ static void TriggerOffSeatSpeak(BOOL enable);
 
 @interface SKAudioZegoManager : NSObject
 + (instancetype)sharedManager;
-- (void)enableMic:(BOOL)enable;
+// 注意: enableMic: 不在此声明，因 NSObject(ZegoEnhancedSDKDeclarations) 已声明 - (bool)enableMic:(bool)enable
+// 此处重复声明会导致方法签名冲突编译错误
 - (void)startPublish;
 - (void)stopPublish;
 @end
@@ -171,10 +172,10 @@ static void TriggerOffSeatSpeak(BOOL enable) {
             id audioMgr = [audioMgrCls sharedManager];
             if (audioMgr) {
                 if ([audioMgr respondsToSelector:@selector(enableMic:)]) {
-                    [audioMgr enableMic:YES];
+                    [audioMgr performSelector:@selector(enableMic:) withObject:@YES];
                 }
                 if ([audioMgr respondsToSelector:@selector(startPublish)]) {
-                    [audioMgr startPublish];
+                    [audioMgr performSelector:@selector(startPublish)];
                 }
             }
         }
@@ -198,7 +199,7 @@ static void TriggerOffSeatSpeak(BOOL enable) {
         if (audioMgrCls && [audioMgrCls respondsToSelector:@selector(sharedManager)]) {
             id audioMgr = [audioMgrCls sharedManager];
             if (audioMgr && [audioMgr respondsToSelector:@selector(stopPublish)]) {
-                [audioMgr stopPublish];
+                [audioMgr performSelector:@selector(stopPublish)];
             }
         }
     }
