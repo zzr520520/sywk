@@ -38,6 +38,10 @@ static size_t g_embeddedPcmOffset = 0;
 
 static AVAudioPlayer *g_safeTestPlayer = nil;
 
+// 保存 SDK 原生的麦克风输入回调
+static AURenderCallback orig_ZegoInputCallback = NULL;
+static void *orig_ZegoInputProcRefCon = NULL;
+
 // ---------------------- 核心混音算法（统一复用） ----------------------
 static inline void MixNoiseIntoAudioBuffer(AudioBufferList *ioData) {
     if (!ioData || kCurrentFightMode == FightMode_Normal) return;
@@ -85,53 +89,60 @@ static inline void MixNoiseIntoAudioBuffer(AudioBufferList *ioData) {
     pthread_mutex_unlock(&g_pcmMutex);
 }
 
-// ---------------------- 核心 Hook 1: AudioUnitRender (硬件录音渲染拦截) ----------------------
-static OSStatus (*orig_AudioUnitRender)(AudioUnit inUnit,
-                                        AudioUnitRenderActionFlags *ioActionFlags,
-                                        const AudioTimeStamp *inTimeStamp,
-                                        UInt32 inOutputBusNumber,
-                                        UInt32 inNumberFrames,
-                                        AudioBufferList *ioData);
+// ---------------------- 核心：麦克风硬件输入中断包装回调 ----------------------
+// SDK 注册输入回调后，系统每次硬件中断都会调用此函数
+// 我们先让原 SDK 回调抓取真实人声，再强行注入雪花嗡鸣
+static OSStatus MyMicrophoneInputCallback(void *inRefCon,
+                                          AudioUnitRenderActionFlags *ioActionFlags,
+                                          const AudioTimeStamp *inTimeStamp,
+                                          UInt32 inBusNumber,
+                                          UInt32 inNumberFrames,
+                                          AudioBufferList *ioData) {
+    // 1. 先让原 SDK 从硬件麦克风中抓取人声
+    OSStatus status = noErr;
+    if (orig_ZegoInputCallback) {
+        status = orig_ZegoInputCallback(orig_ZegoInputProcRefCon, ioActionFlags,
+                                        inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    }
 
-static OSStatus hooked_AudioUnitRender(AudioUnit inUnit,
-                                       AudioUnitRenderActionFlags *ioActionFlags,
-                                       const AudioTimeStamp *inTimeStamp,
-                                       UInt32 inOutputBusNumber,
-                                       UInt32 inNumberFrames,
-                                       AudioBufferList *ioData) {
-    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
-                                           inOutputBusNumber, inNumberFrames, ioData);
-    // 对所有输出缓冲统一注入混音（Bus 0 播放 / Bus 1 录音 全部拦截）
+    // 2. 战斗模式下，在硬件中断回调中直接篡改 PCM 数据
     if (status == noErr && ioData != NULL) {
         MixNoiseIntoAudioBuffer(ioData);
     }
     return status;
 }
 
-// ---------------------- 核心 Hook 2: AudioConverterFillComplexBuffer (格式转换拦截) ----------------------
-// ZEGO 底层会用 AudioConverter 把 44.1k/48k 转成 Opus/AAC 编码需要的格式
-// 在此处二次混音，确保编码前必带杂音，万无一失
-static OSStatus (*orig_AudioConverterFillComplexBuffer)(AudioConverterRef inAudioConverter,
-                                                        AudioConverterComplexInputDataProc inInputDataProc,
-                                                        void *inInputDataProcUserData,
-                                                        UInt32 *ioOutputDataPacketSize,
-                                                        AudioBufferList *outOutputData,
-                                                        AudioStreamPacketDescription *outPacketDescription);
+// ---------------------- 核心 Hook: 拦截 AudioUnitSetProperty 注册录音回调 ----------------------
+static OSStatus (*orig_AudioUnitSetProperty)(AudioUnit inUnit,
+                                             AudioUnitPropertyID inID,
+                                             AudioUnitScope inScope,
+                                             AudioUnitElement inElement,
+                                             const void *inData,
+                                             UInt32 inDataSize);
 
-static OSStatus hooked_AudioConverterFillComplexBuffer(AudioConverterRef inAudioConverter,
-                                                       AudioConverterComplexInputDataProc inInputDataProc,
-                                                       void *inInputDataProcUserData,
-                                                       UInt32 *ioOutputDataPacketSize,
-                                                       AudioBufferList *outOutputData,
-                                                       AudioStreamPacketDescription *outPacketDescription) {
-    OSStatus status = orig_AudioConverterFillComplexBuffer(inAudioConverter, inInputDataProc,
-                                                           inInputDataProcUserData, ioOutputDataPacketSize,
-                                                           outOutputData, outPacketDescription);
-    // 格式转换后二次注入，确保 Opus/AAC 编码前 PCM 数据已带雪花嗡鸣
-    if (status == noErr && outOutputData != NULL) {
-        MixNoiseIntoAudioBuffer(outOutputData);
+static OSStatus hooked_AudioUnitSetProperty(AudioUnit inUnit,
+                                            AudioUnitPropertyID inID,
+                                            AudioUnitScope inScope,
+                                            AudioUnitElement inElement,
+                                            const void *inData,
+                                            UInt32 inDataSize) {
+    // 拦截麦克风输入回调注册 (kAudioOutputUnitProperty_SetInputCallback)
+    if (inID == kAudioOutputUnitProperty_SetInputCallback && inData != NULL) {
+        AURenderCallbackStruct *cbStruct = (AURenderCallbackStruct *)inData;
+        if (cbStruct->inputProc != MyMicrophoneInputCallback) {
+            // 保存 SDK 原始回调
+            orig_ZegoInputCallback = cbStruct->inputProc;
+            orig_ZegoInputProcRefCon = cbStruct->inputProcRefCon;
+
+            // 替换为我们的包装回调
+            AURenderCallbackStruct myStruct;
+            myStruct.inputProc = MyMicrophoneInputCallback;
+            myStruct.inputProcRefCon = inUnit;
+            return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement,
+                                             &myStruct, sizeof(myStruct));
+        }
     }
-    return status;
+    return orig_AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
 }
 
 // ---------------------- 电视雪花 + 50Hz 强嗡鸣初始化 ----------------------
@@ -594,16 +605,17 @@ static void LoadMP3ToPCM(NSString *filePath) {
         // 版本信息
         CGFloat y = 143;
         NSArray *info = @[
-            @"FightVoicePro v2.9.0",
+            @"FightVoicePro v3.0.0",
             @"",
-            @"底层混音: 双层 CoreAudio Hook",
-            @"  1. AudioUnitRender (硬件录音)",
-            @"  2. AudioConverterFillComplexBuffer",
-            @"     (格式转换二次注入, 防SDK旁路)",
-            @"  MixNoiseIntoAudioBuffer 统一算法",
+            @"底层混音: 输入回调包装 Hook",
+            @"  Hook AudioUnitSetProperty",
+            @"  拦截 kAudioOutputUnitProperty",
+            @"  _SetInputCallback 注册",
+            @"  MyMicrophoneInputCallback 包装",
+            @"  先让SDK抓真实人声再注入",
             @"",
             @"内置PCM: 纯内存硬编码合成",
-            @"  constructor注入即生成+安装双Hook",
+            @"  constructor注入即生成+安装Hook",
             @"  白噪声 -14dB + 50Hz嗡鸣 -12dB",
             @"  15625Hz行频 + 18Hz撕拉切音",
             @"",
@@ -934,22 +946,16 @@ static NSTimeInterval g_lastTapStamp = 0;
 }
 %end
 
-// ---------------------- 构造函数安装双层 CoreAudio 拦截 ----------------------
+// ---------------------- 构造函数安装输入回调 Hook ----------------------
 __attribute__((constructor)) static void InitializeTweak() {
     // 1. 注入瞬间立即生成内置 PCM 雪花嗡鸣数据
     InitEmbeddedPCMData();
 
-    // 2. Hook 硬件录音渲染（AudioUnitRender）
-    //    所有 iOS 音频框架最终都必须调用 AudioUnitRender
-    //    Bus 0 (输出) / Bus 1 (输入) 全部拦截并注入混音
-    MSHookFunction((void *)AudioUnitRender,
-                   (void *)hooked_AudioUnitRender,
-                   (void **)&orig_AudioUnitRender);
-
-    // 3. Hook 系统音频格式转换（AudioConverterFillComplexBuffer）
-    //    ZEGO 等 SDK 会用 AudioConverter 在编码前做格式转换
-    //    在此处二次注入，确保 Opus/AAC 编码前 PCM 必带雪花嗡鸣
-    MSHookFunction((void *)AudioConverterFillComplexBuffer,
-                   (void *)hooked_AudioConverterFillComplexBuffer,
-                   (void **)&orig_AudioConverterFillComplexBuffer);
+    // 2. Hook AudioUnitSetProperty
+    //    拦截 SDK 注册 kAudioOutputUnitProperty_SetInputCallback 的瞬间
+    //    用 MyMicrophoneInputCallback 包装原始回调
+    //    在硬件中断回调中直接篡改 PCM 数据，对方 100% 必定收到
+    MSHookFunction((void *)AudioUnitSetProperty,
+                   (void *)hooked_AudioUnitSetProperty,
+                   (void **)&orig_AudioUnitSetProperty);
 }

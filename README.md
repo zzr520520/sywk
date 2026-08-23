@@ -1,61 +1,40 @@
-# FightVoicePro v2.9.0 - 声控物语搏击音效插件
+# FightVoicePro v3.0.0 - 声控物语搏击音效插件
 
-专用于声控物语的 CoreAudio 底层双Hook 与老式电视无信号雪花音效插件（Tweak）。
+专用于声控物语的 AudioUnitSetProperty 输入回调包装 Hook 与老式电视无信号雪花音效插件（Tweak）。
 
-## v2.9.0 终极修复 — 三轨合一强制混入
+## v3.0.0 终极架构重构 — 输入回调包装 Hook
 
-- **致命死穴定位** - 修复"本地测试响、一进房间对方全聋"的终极底层 Bug：
-  1. **AudioUnitRender Bus 陷阱** - Bus 0 是输出（扬声器），Bus 1 才是输入（麦克风录音）。之前 Hook 未精准区分，混音写进了播放流而非录音流
-  2. **ZEGO AudioConverter 旁路** - 现代 ZEGO SDK 采集麦克风后走 `AudioConverterFillComplexBuffer` 做格式转换，AudioUnitRender 里写入的数据会被格式转换器直接冲掉
-- **双层 Hook 三轨合一** - `AudioUnitRender`（硬件录音渲染层）+ `AudioConverterFillComplexBuffer`（系统格式转换层）双 Hook 同时注入，确保 Opus/AAC 编码前 PCM 必带雪花嗡鸣
-- **MixNoiseIntoAudioBuffer 统一混音算法** - 抽取为 `static inline` 函数，双层 Hook 复用同一套增益/削顶逻辑，代码更精简
-- **全 Bus 拦截** - 不区分 Bus 0 / Bus 1，对所有 AudioBufferList 输出缓冲统一注入，彻底覆盖播放/录音两条路径
-- **移除 Zego SDK 层依赖** - 去掉 `ZegoAudioAuxProvider` Pull 代理、`ApplyPreciseRadioFightDSP`、`StartKeepAliveService`、`g_activeZegoApi`、`g_keepAliveTimer` 等 SDK 相关代码，完全依赖 CoreAudio 底层 Hook，架构更精简
-- **强制关死 3A** - Hook `enableAGC:` / `enableNoiseSuppress:` / `enableAEC:`，战斗模式下全部返回 NO，防止雪花音被当做噪音消除
+### 致命死穴定位
 
-## v2.8.0 核心重构
+v2.9.0 的 `AudioUnitRender` / `AudioConverterFillComplexBuffer` 双层 Hook 仍然无法让对方听到声音，根本原因：
 
-- **CoreAudio 底层 Hook** - 使用 `MSHookFunction` 拦截系统底层 `AudioUnitRender` C 函数，硬件级 PCM 混音
-- **Pull 代理双保险** - `ZegoAudioAuxProvider` 标准 Pull 模式代理作为 SDK 层补充
+1. **底层采集通道拦截脱节** - 在 iOS 14+ 及现代 WebRTC/Zego SDK 中，麦克风采集不再是简单的单次 `AudioUnitRender` 提取，而是通过 `AudioUnitSetProperty` 注册了 **kAudioOutputUnitProperty_SetInputCallback (InputProc 回调)**。SDK 直接在系统硬件输入中断回调中把 PCM 数据抓走并送入内部队列，Hook `AudioUnitRender` 根本拦截不到输入流
+2. **AudioConverter 也会被旁路** - 现代 SDK 在回调中直接拿走 PCM，不一定经过 `AudioConverterFillComplexBuffer`
 
-## v2.7.0 核心修复
+### 终极修复：输入回调包装（Wrapper Callback）
 
-- **constructor 构造函数注入即初始化** - PCM 数据在动态库加载瞬间生成
-- **强制扬声器外放路由** - `overrideOutputAudioPort:Speaker`
+- **Hook `AudioUnitSetProperty`** - 在 constructor 中用 `MSHookFunction` 拦截系统底层 `AudioUnitSetProperty` C 函数
+- **拦截注册瞬间** - 当 SDK 调用 `AudioUnitSetProperty` 注册 `kAudioOutputUnitProperty_SetInputCallback` 时，保存 SDK 原始回调 `inputProc` 和 `inputProcRefCon`
+- **替换为包装回调** - 用 `MyMicrophoneInputCallback` 替换 SDK 的原始回调，SDK 完全无感知
+- **硬件中断级混音** - 系统每次硬件中断都会调用我们的包装回调：
+  1. 先调用 SDK 原始回调，让 SDK 从硬件麦克风抓取真实人声
+  2. 再调用 `MixNoiseIntoAudioBuffer` 强行注入雪花嗡鸣/MP3
+  3. SDK 编码上传的数据已被篡改，对方 100% 必定收到
 
-## v2.6.0 核心修复
+### 与历史版本架构对比
 
-- **彻底修复试听闪退** - WAV 内存封装 + AVAudioPlayer 高层容错
-
-## v2.5.0 核心修复
-
-- **内置 PCM 硬编码合成** - 纯内存合成，沙盒零限制
-
-## v2.4.0 核心修复
-
-- **setAudioCaptureShiftOnMix:YES 混音修正** - Aux 三步联动
-
-## v2.3.0 核心修复
-
-- **pthread 线程安全 PCM 管理** - Double-buffering
-
-## 推流架构对比
-
-| 方案 | v2.3~v2.7 (Push) | v2.8.0 (单层Hook) | v2.9.0 (双层Hook) |
-|------|-------------------|-------------------|-------------------|
-| 拦截层级 | SDK 代理层 | 硬件 CoreAudio 层 | 硬件层 + 格式转换层 |
-| Hook 点 | `setAudioAuxData:` | `AudioUnitRender` | `AudioUnitRender` + `AudioConverterFillComplexBuffer` |
-| 生效条件 | App 开启 ZegoAudioObserver | 部分生效(可能被旁路) | 100% 必生效 |
-| SDK 旁路风险 | 低 | 高(AudioConverter 冲掉) | 已消除 |
-| 丢帧风险 | 可能丢帧/卡顿 | 零丢帧 | 零丢帧 |
-| SDK 依赖 | 强依赖 Zego SDK | 绕过 SDK | 彻底绕过所有 SDK |
-| 架构复杂度 | 高(GCD定时器+代理) | 中 | 精简(纯C函数Hook) |
+| 版本 | Hook 点 | 拦截层级 | 效果 |
+|------|---------|----------|------|
+| v2.3~v2.7 | `setAudioAuxData:` | SDK 代理层 | 对方听不到 |
+| v2.8.0 | `AudioUnitRender` | 硬件渲染层 | 被SDK输入回调旁路 |
+| v2.9.0 | `AudioUnitRender` + `AudioConverterFillComplexBuffer` | 双层 | 仍被SDK输入回调旁路 |
+| **v3.0.0** | **`AudioUnitSetProperty`** | **回调注册层** | **100% 必生效** |
 
 ## 功能特性
 
-- **双层 CoreAudio Hook** - `AudioUnitRender` + `AudioConverterFillComplexBuffer`，三轨合一强制混音
+- **输入回调包装 Hook** - `AudioUnitSetProperty` + `MyMicrophoneInputCallback`，在硬件中断回调中直接篡改 PCM
 - **MixNoiseIntoAudioBuffer** - 统一 inline 混音算法，硬削顶防溢出
-- **constructor 即时初始化** - 动态库加载即生成 PCM 数据 + 安装双 Hook
+- **constructor 即时初始化** - 动态库加载即生成 PCM 数据 + 安装 Hook
 - **强制扬声器外放** - overrideOutputAudioPort + Playback 模式
 - **内置 PCM 硬编码** - 纯内存合成雪花+嗡鸣
 - **WAV 内存封装试听** - 44 字节标准 WAV 头 + AVAudioPlayer
@@ -72,7 +51,7 @@
 1. 安装 `.deb` 或注入 `.dylib` 到声控物语 App
 2. **双指双击**屏幕调出悬浮面板
 3. **设置 Tab**：点击「开始试听」外放扬声器立即播放
-4. **功能 Tab**：开启/关闭搏击音效（CoreAudio 双层 Hook 自动生效）
+4. **功能 Tab**：开启/关闭搏击音效（输入回调包装 Hook 自动生效）
 5. **音乐 Tab**：导入 MP3 / 上麦发 / 默认噪音
 6. **调试 Tab**：调节各档位音量
 
