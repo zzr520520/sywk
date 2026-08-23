@@ -3,19 +3,20 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <math.h>
+#import <stdlib.h>
 
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
-    FightMode_New,      // 新清晰搏击 (-18dB 电台噪声 + 50Hz 嗡鸣)
-    FightMode_Old,      // 旧清晰搏击 (-15dB 强力撕扯 + 50Hz 强嗡鸣)
-    FightMode_Super     // 超级战斗 (-12dB 极限撕扯爆破 + 50Hz 极限嗡鸣)
+    FightMode_New,      // 新清晰搏击 (500 音量 + 电视雪花撕扯)
+    FightMode_Old,      // 旧清晰搏击 (1000 音量 + 强力雪花嗡鸣)
+    FightMode_Super     // 超级战斗 (1500 音量 + 极限无信号爆裂)
 } FightAudioMode;
 
-static BOOL kForceOpenMic = YES;      // 强制开麦默认开启
+static BOOL kForceOpenMic = YES;
 static BOOL kSmartNoiseFilter = NO;
 static FightAudioMode kCurrentFightMode = FightMode_New;
 
-// 增益控制
+// 音量控制
 static float kNewFightGain = 500.0f;
 static float kOldFightGain = 1000.0f;
 static float kSuperFightGain = 1500.0f;
@@ -25,18 +26,19 @@ static NSString *kCurrentMusicFile = nil;
 
 static __weak id g_activeZegoApi = nil;
 static dispatch_source_t g_keepAliveTimer = nil;
+static dispatch_source_t g_auxPushTimer = nil;
 
-// MP3 推流内存池
+// MP3 内存池
 static int16_t *g_musicPcmBuffer = NULL;
 static size_t g_musicPcmSize = 0;
 static size_t g_musicPcmOffset = 0;
 
-// 信号发生器相位累加器
-static double g_hum50HzPhase = 0.0;    // 50Hz 正弦波相位
-static double g_tearCarrierPhase = 0.0; // 撕扯载波相位
-static double g_pulsePhase = 0.0;      // 脉冲调制相位
+// 老式电视无信号物理相位
+static double g_hum50HzPhase = 0.0;
+static double g_tvHScanPhase = 0.0; // 15625Hz 电视行频
+static double g_pulsePhase = 0.0;
 
-@interface NSObject (ZegoAPIs)
+@interface NSObject (ZegoSDKDeclarations)
 - (bool)setCaptureVolume:(int)volume;
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
@@ -45,6 +47,9 @@ static double g_pulsePhase = 0.0;      // 脉冲调制相位
 - (bool)enableAEC:(bool)enable;
 - (bool)enableMic:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
+// ZegoAudioAux 辅助混音通道接口
+- (void)enableAux:(bool)enable;
+- (bool)setAudioAuxData:(const void *)data dataLen:(int)dataLen sampleRate:(int)sampleRate channelCount:(int)channelCount;
 @end
 
 // ---------------------- 路径辅助 ----------------------
@@ -80,39 +85,130 @@ static UIWindow *GetKeyWindow() {
     return keyWindow;
 }
 
-// ---------------------- 硬件级 PCM 撕裂 + 50Hz 嗡鸣 DSP ----------------------
-static inline int16_t ProcessBattleDSP(int16_t inputSample, float gain, float noiseLevelDB, float humLevelDB) {
-    // 1. 人声音量直接线性放大
-    float sample = (float)inputSample * (gain / 100.0f);
+// ---------------------- 电视无信号雪花音核心生成器 ----------------------
+static inline int16_t GenerateTVSnowSample(float noiseLevelDB, float humLevelDB) {
+    // 1. 产生纯正老式电视高斯雪花白噪声 (全频随机脉冲)
+    float whiteNoise = (((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f);
+    float noiseAmp = 32767.0f * powf(10.0f, noiseLevelDB / 20.0f);
 
-    // 2. 叠加 50Hz 强正弦波嗡鸣 (-15dB 左右：amplitude ≈ 32767 * 10^(dB/20))
+    // 2. 50Hz 电视场频交流电嗡鸣 (粗糙工频声)
     g_hum50HzPhase += 50.0 / 44100.0;
     if (g_hum50HzPhase >= 1.0) g_hum50HzPhase -= 1.0;
     float humAmp = 32767.0f * powf(10.0f, humLevelDB / 20.0f);
-    float humSignal = sinf(g_hum50HzPhase * 2.0 * M_PI) * humAmp;
+    float hum = sinf(g_hum50HzPhase * 2.0 * M_PI) * humAmp;
 
-    // 3. 产生 -12dB ~ -18dB 明显响亮的机械电台撕拉调制
-    g_pulsePhase += 16.0 / 44100.0;
+    // 3. 15.625kHz 显像管高频啸叫载波
+    g_tvHScanPhase += 15625.0 / 44100.0;
+    if (g_tvHScanPhase >= 1.0) g_tvHScanPhase -= 1.0;
+    float hScan = sinf(g_tvHScanPhase * 2.0 * M_PI) * (noiseAmp * 0.15f);
+
+    // 4. 20Hz 电视画面跳帧切音撕拉调制
+    g_pulsePhase += 20.0 / 44100.0;
     if (g_pulsePhase >= 1.0) g_pulsePhase -= 1.0;
-    float pulse = (sinf(g_pulsePhase * 2.0 * M_PI) > 0.0) ? 1.0f : 0.35f;
+    float tearMod = (sinf(g_pulsePhase * 2.0 * M_PI) > -0.2) ? 1.0f : 0.3f;
 
-    g_tearCarrierPhase += 2200.0 / 44100.0;
-    if (g_tearCarrierPhase >= 1.0) g_tearCarrierPhase -= 1.0;
-    float noiseAmp = 32767.0f * powf(10.0f, noiseLevelDB / 20.0f);
-    float tearNoise = sinf(g_tearCarrierPhase * 2.0 * M_PI) * noiseAmp * pulse;
-
-    // 4. 全频段混合 (人声 + 50Hz嗡鸣 + 响亮机械撕裂噪声)
-    sample = (sample * pulse) + humSignal + tearNoise;
-
-    // 5. 硬削顶 (Hard-Clipping 保持过载失真感)
-    if (sample > 32767.0f) sample = 32767.0f;
-    if (sample < -32768.0f) sample = -32768.0f;
-
-    return (int16_t)sample;
+    float result = (whiteNoise * noiseAmp * tearMod) + hum + hScan;
+    if (result > 32767.0f) result = 32767.0f;
+    if (result < -32768.0f) result = -32768.0f;
+    return (int16_t)result;
 }
 
-// ---------------------- 核心 Hook: 强制开麦与音频流 ----------------------
-// 1. 强制拦截业务层 SKAudioZegoManager 开麦状态
+// ---------------------- Aux 持续灌流推流线程 (解决推不上去问题) ----------------------
+static void StartAuxDataInjector() {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+        g_auxPushTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        // 每 20ms 发送一帧 (44100Hz 下 20ms = 882 samples)
+        dispatch_source_set_timer(g_auxPushTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(20 * NSEC_PER_MSEC), 0);
+        dispatch_source_set_event_handler(g_auxPushTimer, ^{
+            if (!g_activeZegoApi || kCurrentFightMode == FightMode_Normal) return;
+
+            int sampleCount = 882;
+            int16_t frameBuffer[882];
+
+            float noiseDB = -18.0f;
+            float humDB = -15.0f;
+            if (kCurrentFightMode == FightMode_Old) { noiseDB = -15.0f; humDB = -13.0f; }
+            if (kCurrentFightMode == FightMode_Super) { noiseDB = -12.0f; humDB = -11.0f; }
+
+            for (int i = 0; i < sampleCount; i++) {
+                int16_t snow = GenerateTVSnowSample(noiseDB, humDB);
+                if (g_musicPcmBuffer && g_musicPcmSize > 0) {
+                    int16_t music = g_musicPcmBuffer[g_musicPcmOffset++];
+                    if (g_musicPcmOffset >= g_musicPcmSize) g_musicPcmOffset = 0;
+                    snow = (int16_t)((snow + music) / 2);
+                }
+                frameBuffer[i] = snow;
+            }
+
+            // 直接通过 SDK 核心 ZegoAudioAux 通道持续注入上行混音流
+            id zegoApi = g_activeZegoApi;
+            if (zegoApi && [zegoApi respondsToSelector:@selector(setAudioAuxData:dataLen:sampleRate:channelCount:)]) {
+                [zegoApi setAudioAuxData:frameBuffer dataLen:sampleCount * (int)sizeof(int16_t) sampleRate:44100 channelCount:1];
+            }
+        });
+        dispatch_resume(g_auxPushTimer);
+    });
+}
+
+// ---------------------- 核心调音与 3A 锁定 ----------------------
+static void ApplyPreciseRadioFightDSP(id zegoApi) {
+    if (!zegoApi) return;
+
+    if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) {
+        [zegoApi enableMic:YES];
+    }
+
+    if (kCurrentFightMode == FightMode_Normal) {
+        if ([zegoApi respondsToSelector:@selector(enableAux:)]) [zegoApi enableAux:NO];
+        if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
+        if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
+        if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
+        if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
+        if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
+            for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
+        }
+        return;
+    }
+
+    // 开启 Aux 混音通道
+    if ([zegoApi respondsToSelector:@selector(enableAux:)]) {
+        [zegoApi enableAux:YES];
+    }
+
+    // 强制关闭 3A，防止雪花白噪与 50Hz 嗡鸣被消除
+    if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
+    if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
+    if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
+    if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
+
+    // 设置指定麦克风增益
+    float baseGain = kNewFightGain;
+    if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
+    if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
+    int finalVolume = (int)(baseGain * kVoiceGainRatio);
+
+    if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) {
+        [zegoApi setCaptureVolume:finalVolume];
+    }
+
+    // 20Hz-20kHz 全频保留，不切低频嗡鸣，强化咬字齿音
+    if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
+        [zegoApi setAudioEqualizerGain:6.0f index:0];  // 31Hz
+        [zegoApi setAudioEqualizerGain:8.0f index:1];  // 62Hz 50Hz嗡鸣区
+        [zegoApi setAudioEqualizerGain:4.0f index:2];  // 125Hz
+        [zegoApi setAudioEqualizerGain:0.0f index:3];  // 250Hz 直通
+        [zegoApi setAudioEqualizerGain:0.0f index:4];  // 500Hz 直通
+        [zegoApi setAudioEqualizerGain:6.0f index:5];  // 1kHz
+        [zegoApi setAudioEqualizerGain:10.0f index:6]; // 2kHz
+        [zegoApi setAudioEqualizerGain:12.0f index:7]; // 4kHz 齿音穿透
+        [zegoApi setAudioEqualizerGain:8.0f index:8];  // 8kHz
+        [zegoApi setAudioEqualizerGain:6.0f index:9];  // 16kHz
+    }
+}
+
+// ---------------------- Hook 业务与底层 ----------------------
 %hook SKAudioZegoManager
 
 - (void)enableMic:(BOOL)enable {
@@ -121,6 +217,9 @@ static inline int16_t ProcessBattleDSP(int16_t inputSample, float gain, float no
     } else {
         %orig(enable);
     }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyPreciseRadioFightDSP(g_activeZegoApi);
+    });
 }
 
 - (BOOL)micEnabled {
@@ -130,7 +229,6 @@ static inline int16_t ProcessBattleDSP(int16_t inputSample, float gain, float no
 
 %end
 
-// 2. 拦截麦克风权限管理器
 %hook SKMicrophonePermissionManager
 
 + (BOOL)hasMicrophonePermission {
@@ -140,12 +238,12 @@ static inline int16_t ProcessBattleDSP(int16_t inputSample, float gain, float no
 
 %end
 
-// 3. 拦截 ZegoLiveRoomApi
 %hook ZegoLiveRoomApi
 
 - (id)init {
     id inst = %orig;
     g_activeZegoApi = inst;
+    StartAuxDataInjector();
     return inst;
 }
 
@@ -166,84 +264,27 @@ static inline int16_t ProcessBattleDSP(int16_t inputSample, float gain, float no
     return %orig(volume);
 }
 
-// 拦截底层麦克风采集帧，全通灌入 DSP 与 MP3
-- (void)onCaptureAudioFrame:(void *)audioFrame {
-    %orig;
-    if (!audioFrame || kCurrentFightMode == FightMode_Normal) return;
+- (bool)startPublishing:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo {
+    g_activeZegoApi = self;
+    bool res = %orig;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyPreciseRadioFightDSP(weakSelf);
+    });
+    return res;
+}
 
-    int16_t *samples = (int16_t *)*(void **)audioFrame;
-    int sampleCount = *(int *)((char *)audioFrame + sizeof(void *));
-    if (!samples || sampleCount <= 0) return;
-
-    float gain = kNewFightGain;
-    float noiseDB = -18.0f;
-    float humDB = -15.0f;
-
-    if (kCurrentFightMode == FightMode_Old) {
-        gain = kOldFightGain;
-        noiseDB = -15.0f;
-        humDB = -13.0f;
-    } else if (kCurrentFightMode == FightMode_Super) {
-        gain = kSuperFightGain;
-        noiseDB = -12.0f;
-        humDB = -11.0f;
-    }
-
-    gain *= kVoiceGainRatio;
-
-    for (int i = 0; i < sampleCount; i++) {
-        // 混入 MP3
-        if (g_musicPcmBuffer && g_musicPcmSize > 0) {
-            int16_t music = g_musicPcmBuffer[g_musicPcmOffset++];
-            if (g_musicPcmOffset >= g_musicPcmSize) g_musicPcmOffset = 0;
-            samples[i] = (int16_t)((samples[i] + music) / 2);
-        }
-        // 注入 50Hz 嗡鸣与机械撕扯
-        samples[i] = ProcessBattleDSP(samples[i], gain, noiseDB, humDB);
-    }
+- (bool)startPublishing2:(NSString *)streamID title:(NSString *)title flag:(int)flag extraInfo:(NSString *)extraInfo params:(NSString *)params channelIndex:(int)channelIndex {
+    g_activeZegoApi = self;
+    bool res = %orig;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApplyPreciseRadioFightDSP(weakSelf);
+    });
+    return res;
 }
 
 %end
-
-// ---------------------- 彻底禁用 3A 与保留全频段 ----------------------
-static void ApplyPreciseRadioFightDSP(id zegoApi) {
-    if (!zegoApi) return;
-
-    if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) {
-        [zegoApi enableMic:YES];
-    }
-
-    if (kCurrentFightMode == FightMode_Normal) {
-        if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
-        if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
-        if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
-        if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
-        if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-            for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
-        }
-        return;
-    }
-
-    // 必须关闭：自动增益、降噪、瞬态噪声抑制、噪声门
-    if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
-    if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
-    if ([zegoApi respondsToSelector:@selector(enableTransientNoiseSuppress:)]) [zegoApi enableTransientNoiseSuppress:NO];
-    if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
-
-    // 全频段 EQ 直通放行，禁用高通/低切，低频段微调提升
-    if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-        [zegoApi setAudioEqualizerGain:6.0f index:0];  // 31Hz 保留低频嗡鸣
-        [zegoApi setAudioEqualizerGain:8.0f index:1];  // 62Hz 50Hz正弦波增强区
-        [zegoApi setAudioEqualizerGain:4.0f index:2];  // 125Hz
-        [zegoApi setAudioEqualizerGain:0.0f index:3];  // 250Hz 直通
-        [zegoApi setAudioEqualizerGain:0.0f index:4];  // 500Hz 直通
-        [zegoApi setAudioEqualizerGain:6.0f index:5];  // 1kHz
-        [zegoApi setAudioEqualizerGain:10.0f index:6]; // 2kHz
-        [zegoApi setAudioEqualizerGain:12.0f index:7]; // 4kHz 清晰齿音
-        [zegoApi setAudioEqualizerGain:8.0f index:8];  // 8kHz
-        [zegoApi setAudioEqualizerGain:6.0f index:9];  // 16kHz
-    }
-}
 
 // ---------------------- 保活线程 ----------------------
 static void StartKeepAliveService() {
@@ -302,10 +343,14 @@ static void LoadMP3ToPCM(NSString *filePath) {
         if (sampleBuffer) {
             CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sampleBuffer);
             size_t len = CMBlockBufferGetDataLength(block);
-            char *buf = (char *)malloc(len);
-            CMBlockBufferCopyDataBytes(block, 0, len, buf);
-            [pcmData appendBytes:buf length:len];
-            free(buf);
+            if (len > 0) {
+                char *buf = (char *)malloc(len);
+                if (buf) {
+                    CMBlockBufferCopyDataBytes(block, 0, len, buf);
+                    [pcmData appendBytes:buf length:len];
+                    free(buf);
+                }
+            }
             CFRelease(sampleBuffer);
         } else {
             break;
@@ -628,12 +673,17 @@ static void LoadMP3ToPCM(NSString *filePath) {
 
 - (void)setupSettingPage {
     NSArray *info = @[
-        @"FightVoicePro v2.1.0",
+        @"FightVoicePro v2.2.0",
         @"",
-        @"DSP 参数:",
-        @"  脉冲调制: 16Hz",
-        @"  撕扯载波: 2200Hz",
-        @"  嗡鸣频率: 50Hz",
+        @"推流通道: ZegoAudioAux",
+        @"  enableAux: + setAudioAuxData:",
+        @"  20ms 定时注入 (882 samples/frame)",
+        @"",
+        @"TV 雪花 DSP 参数:",
+        @"  白噪声: 全频段随机脉冲",
+        @"  50Hz: 交流工频场电嗡鸣",
+        @"  15625Hz: 显像管行频啸叫",
+        @"  20Hz: 场扫描失步切音",
         @"  采样率: 44100Hz / 16-bit",
         @"",
         @"强制开麦: 多重Hook拦截",
@@ -706,7 +756,7 @@ static void LoadMP3ToPCM(NSString *filePath) {
 
 @end
 
-// ---------------------- 双指双击手势唤醒 ----------------------
+// ---------------------- 双指双击手势 ----------------------
 static BattleMasterHUD *g_hudInstance = nil;
 static NSTimeInterval g_lastTapStamp = 0;
 
@@ -726,6 +776,7 @@ static NSTimeInterval g_lastTapStamp = 0;
 
 - (void)attachToWindow:(UIWindow *)window {
     if (!window) return;
+    // 避免重复注册手势
     for (UIGestureRecognizer *g in window.gestureRecognizers) {
         if ([g isKindOfClass:[UITapGestureRecognizer class]] && ((UITapGestureRecognizer *)g).numberOfTouchesRequired == 2) {
             return;
@@ -750,6 +801,8 @@ static NSTimeInterval g_lastTapStamp = 0;
     g_lastTapStamp = now;
 
     UIWindow *targetWindow = GetKeyWindow();
+    if (!targetWindow) return;
+
     if (!g_hudInstance) {
         g_hudInstance = [[BattleMasterHUD alloc] initWithFrame:CGRectMake(25, 120, 285, 240)];
         [targetWindow addSubview:g_hudInstance];
@@ -767,7 +820,7 @@ static NSTimeInterval g_lastTapStamp = 0;
 
 @end
 
-// ---------------------- 注入启动 ----------------------
+// ---------------------- 注入启动 (合并 UIWindow hook) ----------------------
 %hook UIWindow
 
 - (void)makeKeyAndVisible {
