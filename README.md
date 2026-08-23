@@ -1,51 +1,72 @@
-# FightVoicePro v7.5.0 - 声控物语搏击音效插件
+# FightVoicePro v7.6.0 - 声控物语搏击音效插件
 
-终极防掐断方案：彻底拦截角色降级 + 推流心跳保护 + 拉流列表防清空 + 周期性拉流恢复，实现被踢/下麦后持续推流与收听。
+100% 杜绝"下麦全哑、开麦无声"：阻断房间退出 + 单路拉流防停 + 麦位模型伪装 + 推流心跳保护 + 拉流列表防清空。
 
-## v7.5.0 核心升级 — 终极防掐断闭环
+## v7.6.0 核心升级 — 阻断房间退出与单路拉流
 
-### 一、v7.5.0 新增改进（在 v7.4.0 基础上）
+### 一、v7.6.0 新增（在 v7.5.0 基础上）
 
-| 改进点 | v7.4.0 | v7.5.0 |
-|--------|--------|--------|
-| `changeRoleToChat:` | `%orig(1)` 仍调原始方法 | **完全 `return`**，不触发任何降级副作用 |
-| `saveStreamListAll:` | 未拦截 | **新增 Hook**，保存后立即恢复播放 |
-| `onStreamUpdated:` | 恢复拉流 | **增加 `muteMic:NO`**，流变动后重新开麦 |
-| 保活线程 | 仅 `enableSpeaker` | **增加周期 `checkAllStreams`**，防止流列表被清空 |
+| 新增拦截点 | 方法 | 策略 | 解决问题 |
+|------------|------|------|----------|
+| 引擎退出房间 | `ZegoAudioRoomApi logoutRoom` | 返回 NO 阻止退出 | 被踢时断开所有流连接 |
+| 管理器退出房间 | `SKAudioZegoManager leaveRoomWithCompletionBlock:` | 拦截+执行 block 回调 | 管理器层断开房间 |
+| 单路拉流停止 | `ZegoAudioRoomApi stopPlayStream:` | 直接 return | 个别流被停播导致听不到对方 |
+| 麦位模型伪装 | `SWRoomMicroModel isDownMicCommand` | 返回 NO | 从数据源无视下麦信令 |
+| 麦位模型伪装 | `SWRoomMicroModel isOnMicroOperate` | 返回 YES | 业务层认为仍在上麦 |
+| 麦位模型伪装 | `SWRoomMicroModel isCurrentUser` | 返回 YES | 当前用户仍被标记有效 |
 
-### 二、完整防掐断拦截链路
+### 二、完整防掐断拦截链路（v7.6.0 全景）
 
 ```
 被踢/下麦触发
-  ├─ changeRoleToChat:    → 完全return拦截（不调%orig，零副作用）
-  ├─ setStartPushTimer:   → timer==nil时拦截（保住推流心跳）
-  ├─ removeStreamListAll  → 拒绝清空拉流列表
-  ├─ saveStreamListAll:  → 保存后立即恢复播放（新增）
-  ├─ muteAllRemote:      → 强制NO
-  ├─ enableSpeaker:      → 强制YES
-  ├─ stopPublishing      → 台下开麦时拦截
-  ├─ stopPublish         → 台下开麦时拦截
-  └─ onStreamUpdated:    → 恢复拉流+重新开麦+checkAllStreams
-
-保活线程 (0.8s)
-  ├─ enableSpeaker:YES   → 持续锁定扬声器
-  ├─ ApplyCrystalDSP     → 刷新增益+EQ参数
-  └─ checkAllStreams      → 周期性拉流恢复（新增）
+  │
+  ├─ 数据源层
+  │   ├─ SWRoomMicroModel.isDownMicCommand → 返回 NO（非下麦指令）
+  │   ├─ SWRoomMicroModel.isOnMicroOperate → 返回 YES（仍在上麦）
+  │   └─ SWRoomMicroModel.isCurrentUser    → 返回 YES（用户有效）
+  │
+  ├─ 房间退出层
+  │   ├─ ZegoAudioRoomApi.logoutRoom        → 返回 NO（阻止引擎退出）
+  │   └─ SKAudioZegoManager.leaveRoomWithCompletionBlock: → 拦截+回调block
+  │
+  ├─ 推流保护层
+  │   ├─ changeRoleToChat:                  → 完全 return（不调 %orig）
+  │   ├─ setStartPushTimer: nil             → 拦截（保住心跳）
+  │   ├─ stopPublishing                     → 台下开麦时拦截
+  │   └─ stopPublish                        → 台下开麦时拦截
+  │
+  ├─ 拉流保护层
+  │   ├─ stopPlayStream:                    → 直接 return（单路不停播）
+  │   ├─ removeStreamListAll                → 拒绝清空
+  │   ├─ saveStreamListAll:                 → 保存后恢复播放
+  │   ├─ muteAllRemote:                     → 强制 NO
+  │   ├─ enableSpeaker:                     → 强制 YES
+  │   └─ onStreamUpdated:stream:            → 恢复拉流+重新开麦+checkAllStreams
+  │
+  └─ 保活线程 (0.8s)
+      ├─ enableSpeaker:YES                  → 持续锁定扬声器
+      ├─ ApplyCrystalDSP                    → 刷新增益+EQ参数
+      └─ checkAllStreams                    → 周期性拉流恢复
 ```
 
-### 三、防掐断拦截对照表
+### 三、防掐断拦截对照表（全部 14 项）
 
-| 拦截目标 | 方法 | 拦截策略 | 报告章节 |
-|----------|------|----------|----------|
-| 角色降级 | `changeRoleToChat:` | 完全return，不调%orig | 4.2.2 |
-| 推流心跳销毁 | `setStartPushTimer:` | timer==nil时拦截 | 4.2.2 |
-| 拉流列表清空 | `removeStreamListAll` | 强制开麦/台下开麦时拒绝 | 4.2.2 |
-| 拉流列表保存 | `saveStreamListAll:` | 保存后立即恢复播放 | 4.2.2 |
-| 远端流变动 | `onStreamUpdated:stream:` | 恢复拉流+重新开麦 | 4.2.2 |
-| 远端静音 | `muteAllRemote:` | 强制NO | 3.2.1 |
-| 扬声器关闭 | `enableSpeaker:` | 强制YES | 3.2.1 |
-| 底层停推 | `stopPublish` | 台下开麦时拦截 | 3.2.1 |
-| 业务层停推 | `stopPublishing` | 台下开麦时拦截 | 8.2 |
+| # | 拦截目标 | 方法 | 拦截策略 | 报告章节 | 版本 |
+|---|----------|------|----------|----------|------|
+| 1 | 麦位下麦指令 | `isDownMicCommand` | 返回 NO | 4.2.2 | v7.6.0 |
+| 2 | 麦位上麦状态 | `isOnMicroOperate` | 返回 YES | 4.2.2 | v7.6.0 |
+| 3 | 当前用户有效 | `isCurrentUser` | 返回 YES | 4.2.2 | v7.6.0 |
+| 4 | 引擎退出房间 | `logoutRoom` | 返回 NO | 3.2.1 | v7.6.0 |
+| 5 | 管理器退出房间 | `leaveRoomWithCompletionBlock:` | 拦截+回调 | 8.2 | v7.6.0 |
+| 6 | 单路拉流停止 | `stopPlayStream:` | 直接 return | 3.2.1 | v7.6.0 |
+| 7 | 角色降级 | `changeRoleToChat:` | 完全 return | 4.2.2 | v7.5.0 |
+| 8 | 推流心跳销毁 | `setStartPushTimer:` | nil 时拦截 | 4.2.2 | v7.4.0 |
+| 9 | 拉流列表清空 | `removeStreamListAll` | 拒绝清空 | 4.2.2 | v7.4.0 |
+| 10 | 拉流列表保存 | `saveStreamListAll:` | 保存后恢复 | 4.2.2 | v7.5.0 |
+| 11 | 远端流变动 | `onStreamUpdated:stream:` | 恢复+开麦 | 4.2.2 | v7.4.0 |
+| 12 | 远端静音 | `muteAllRemote:` | 强制 NO | 3.2.1 | v7.3.0 |
+| 13 | 底层停推 | `stopPublish` | 台下开麦拦截 | 3.2.1 | v7.3.0 |
+| 14 | 业务层停推 | `stopPublishing` | 台下开麦拦截 | 8.2 | v7.3.0 |
 
 ### 四、三档清晰模式
 
@@ -72,16 +93,16 @@
 
 ## 功能特性
 
-- **终极防掐断** - changeRoleToChat 完全return + startPushTimer保护 + removeStreamListAll拦截
-- **拉流双重保护** - removeStreamListAll拒绝清空 + saveStreamListAll保存后恢复
-- **周期拉流恢复** - 0.8s保活线程增加checkAllStreams
-- **流变动重新开麦** - onStreamUpdated触发muteMic:NO
+- **阻断房间退出** - logoutRoom + leaveRoomWithCompletionBlock 双拦截
+- **单路拉流防停** - stopPlayStream 直接丢弃，保持全量拉流
+- **麦位模型伪装** - SWRoomMicroModel 三属性从数据源无视下麦信令
+- **终极防掐断** - changeRoleToChat 完全 return + startPushTimer 保护
+- **拉流双重保护** - removeStreamListAll 拒绝清空 + saveStreamListAll 恢复
+- **周期拉流恢复** - 0.8s 保活线程 checkAllStreams
+- **流变动重新开麦** - onStreamUpdated 触发 muteMic:NO
 - **ZegoAudioRoomApi 正确类名** - 逆向报告确认的真实引擎类
 - **业务层双管台下开麦** - SKAudioZegoManager + ZegoAudioRoomApi 协同推流
-- **stopPublish/stopPublishing 双拦截** - 台下开麦时防止 App 终止推流
 - **封顶纯净增益** - 400/600/1000 消除方波失真
-- **纯净人声** - 彻底移除所有背景音效
-- **高通切除** - 31Hz~500Hz 削减，释放动态空间
 - **iOS 13+ 兼容** - UIWindowScene 适配 + 手势去重
 
 ## 使用方法

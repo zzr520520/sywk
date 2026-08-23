@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 7.5.0
+Version: 7.6.0
 Architecture: iphoneos-arm64
-Description: v7.5.0终极防掐断(changeRoleToChat完全return拦截不调%orig+saveStreamListAll新增hook+onStreamUpdated增强muteMic:NO+保活线程周期checkAllStreams)+v7.4.0基础(removeStreamListAll拦截+setStartPushTimer保护+onStreamUpdated拉流恢复)+ZegoAudioRoomApi正确类名+zegoEngine捕获+业务层台下开麦(muteMic+startPublishing+startPublish双管)+stopPublish/stopPublishing拦截+封顶增益400/600/1000+10段EQ纯净人声+关闭3A+0.8s保活(enableSpeaker持续锁定)+iOS13+适配+手势去重+前置声明
+Description: v7.6.0阻断房间退出+单路拉流(logoutRoom返回NO+leaveRoomWithCompletionBlock拦截+stopPlayStream拦截+SWRoomMicroModel三属性伪装)+v7.5.0终极防掐断(changeRoleToChat完全return+saveStreamListAll+onStreamUpdated增强muteMic+保活checkAllStreams)+v7.4.0基础(removeStreamListAll+setStartPushTimer保护)+ZegoAudioRoomApi正确类名+业务层台下开麦+stopPublish/stopPublishing双拦截+封顶增益400/600/1000+10段EQ纯净人声+关闭3A+0.8s保活+iOS13+适配+手势去重+前置声明
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks

@@ -35,6 +35,8 @@ static void TriggerOffSeatSpeak(BOOL enable);
 - (BOOL)startPublishWithStreamID:(NSString *)streamID;
 - (void)stopPublish;
 - (BOOL)startPlayStream:(NSString *)streamID;
+- (void)stopPlayStream:(NSString *)streamID;       // v7.6.0: 拦截单路拉流停止
+- (BOOL)logoutRoom;                                 // v7.6.0: 拦截退出房间
 - (BOOL)enableMic:(BOOL)enable;
 - (BOOL)enableSpeaker:(BOOL)enable;
 - (void)setCaptureVolume:(int)volume;
@@ -63,6 +65,13 @@ static void TriggerOffSeatSpeak(BOOL enable);
 - (void)removeStreamListAll;       // 报告4.2.2确认
 - (void)saveStreamListAll:(NSArray *)streams;
 - (void)onStreamUpdated:(NSUInteger)type stream:(NSArray *)streams;
+- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block;  // v7.6.0: 拦截退出房间
+@end
+
+@interface SWRoomMicroModel : NSObject    // v7.6.0: 麦位模型伪装
+@property (nonatomic, assign) BOOL isDownMicCommand;
+@property (nonatomic, assign) BOOL isOnMicroOperate;
+@property (nonatomic, assign) BOOL isCurrentUser;
 @end
 
 @interface SKAudioManager : NSObject
@@ -301,6 +310,16 @@ static void TriggerOffSeatSpeak(BOOL enable) {
     %orig(timer);
 }
 
+// 7. v7.6.0: 拦截退出房间（被踢时防止管理器层断开房间连接）
+- (BOOL)leaveRoomWithCompletionBlock:(void (^)(void))block {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        // 阻止真正退出，同时执行 block 回调避免卡死
+        if (block) block();
+        return NO;
+    }
+    return %orig(block);
+}
+
 %end
 
 %hook SKAudioManager
@@ -322,6 +341,32 @@ static void TriggerOffSeatSpeak(BOOL enable) {
         return;
     }
     %orig(role);
+}
+
+%end
+
+// v7.6.0: 麦位模型伪装 — 从数据源头让业务层认为用户仍在麦上
+%hook SWRoomMicroModel
+
+- (BOOL)isDownMicCommand {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        return NO;  // 伪装：非下麦指令
+    }
+    return %orig;
+}
+
+- (BOOL)isOnMicroOperate {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        return YES;  // 伪装：仍在上麦操作中
+    }
+    return %orig;
+}
+
+- (BOOL)isCurrentUser {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        return YES;  // 伪装：当前用户仍有效
+    }
+    return %orig;
 }
 
 %end
@@ -361,6 +406,22 @@ static void TriggerOffSeatSpeak(BOOL enable) {
         return;
     }
     %orig;
+}
+
+// v7.6.0: 拦截退出房间（被踢时防止断开所有流连接）
+- (BOOL)logoutRoom {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        return NO;  // 返回失败，阻止退出
+    }
+    return %orig;
+}
+
+// v7.6.0: 拦截单路拉流停止（防止个别流被停播导致听不到对方）
+- (void)stopPlayStream:(NSString *)streamID {
+    if (kOffSeatSpeak || kForceOpenMic) {
+        return;  // 直接丢弃，保持全量拉流
+    }
+    %orig(streamID);
 }
 
 %end
