@@ -44,10 +44,10 @@ static UIWindow *GetKeyWindow(void);
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
 
 // Zego 媒体播放器推流接口
+// 注意: stop 方法在系统框架中已有多处 - (void)stop 声明，此处不重复声明以避免歧义
 - (void)setAudioStreamType:(int)type;
 - (void)setProcessType:(int)type;
 - (bool)start:(NSString *)path;
-- (bool)stop;
 - (void)setPublishVolume:(int)volume;
 - (void)setPlayoutVolume:(int)volume;
 @end
