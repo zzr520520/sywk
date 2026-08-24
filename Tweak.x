@@ -11,6 +11,7 @@ typedef enum : NSUInteger {
 
 static BOOL kForceOpenMic = YES;      // 强制开麦
 static BOOL kOffSeatSpeak = NO;       // 台下常驻开麦 / 防踢防哑
+static BOOL kDebugCaptureHTTP = NO;   // 抓包调试模式：捕获房间相关 HTTP 请求并弹窗显示
 static FightAudioMode kCurrentFightMode = FightMode_New;
 
 static float kNewFightGain = 400.0f;
@@ -202,11 +203,38 @@ static void EnsureAllStreamsPlaying(id mgrId) {
     }
 }
 
-// ---------------------- 1. HTTP 拦截（阻断下麦/被踢/退出房间所有请求） ----------------------
+// ---------------------- 1. HTTP 拦截 + 抓包调试（阻断下麦/被踢/退出房间所有请求） ----------------------
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
     NSString *urlStr = request.URL.absoluteString;
+
+    // 抓包调试：捕获所有 /room/ 相关请求并弹窗显示
+    if (kDebugCaptureHTTP && [urlStr containsString:@"/room/"]) {
+        NSString *bodyStr = @"";
+        if (request.HTTPBody) {
+            bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+        }
+        NSDictionary *headers = request.allHTTPHeaderFields;
+        NSString *logInfo = [NSString stringWithFormat:@"URL: %@\n\nMethod: %@\n\nHeaders: %@\n\nBody: %@", urlStr, request.HTTPMethod, headers, bodyStr];
+
+        NSLog(@"[SKWY_HOOK_HTTP] %@", logInfo);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"捕获到房间请求" message:logInfo preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [UIPasteboard generalPasteboard].string = logInfo;
+            }]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+
+            UIWindow *keyWin = GetKeyWindow();
+            UIViewController *rootVC = keyWin.rootViewController;
+            while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
+            [rootVC presentViewController:alert animated:YES completion:nil];
+        });
+    }
+
+    // 拦截下麦/被踢/退出房间请求
     if (kForceOpenMic || kOffSeatSpeak) {
         NSArray *blockPaths = @[
             @"/room/microphone/down",
@@ -505,6 +533,7 @@ static void StartKeepAliveService() {
 
 @property (nonatomic, strong) UISwitch *swForceMic;
 @property (nonatomic, strong) UISwitch *swOffSeatSpeak;
+@property (nonatomic, strong) UISwitch *swDebugCapture;
 @property (nonatomic, strong) UISwitch *swNewFight;
 @property (nonatomic, strong) UISwitch *swOldFight;
 @property (nonatomic, strong) UISwitch *swSuperFight;
@@ -572,7 +601,7 @@ static void StartKeepAliveService() {
     proc.clipsToBounds = YES;
     [self.funcPageView addSubview:proc];
 
-    NSArray *titles = @[@"强制开麦", @"台下常驻开麦", @"屏蔽滋啦杂音", @"新清晰效果", @"旧清晰效果", @"超级清晰效果"];
+    NSArray *titles = @[@"强制开麦", @"台下常驻开麦", @"抓包调试", @"新清晰效果", @"旧清晰效果", @"超级清晰效果"];
     for (int i = 0; i < titles.count; i++) {
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8, 30 + i * 32, self.funcPageView.frame.size.width - 16, 28)];
         row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
@@ -592,6 +621,7 @@ static void StartKeepAliveService() {
 
         if (i == 0) { self.swForceMic = sw; [sw setOn:kForceOpenMic]; }
         if (i == 1) { self.swOffSeatSpeak = sw; [sw setOn:kOffSeatSpeak]; }
+        if (i == 2) { self.swDebugCapture = sw; [sw setOn:kDebugCaptureHTTP]; }
         if (i == 3) { self.swNewFight = sw; [sw setOn:YES]; }
         if (i == 4) self.swOldFight = sw;
         if (i == 5) self.swSuperFight = sw;
@@ -634,6 +664,20 @@ static void StartKeepAliveService() {
 
 - (void)onFuncSwitch:(UISwitch *)s {
     if (s == self.swForceMic) kForceOpenMic = s.isOn;
+    if (s == self.swDebugCapture) {
+        kDebugCaptureHTTP = s.isOn;
+        if (s.isOn) {
+            // 开启抓包时提示用户操作 App
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *hint = [UIAlertController alertControllerWithTitle:@"抓包调试已开启" message:@"现在操作房间相关功能（上麦/下麦/踢人等），请求参数将自动弹窗显示并可复制。" preferredStyle:UIAlertControllerStyleAlert];
+                [hint addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+                UIWindow *keyWin = GetKeyWindow();
+                UIViewController *rootVC = keyWin.rootViewController;
+                while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
+                [rootVC presentViewController:hint animated:YES completion:nil];
+            });
+        }
+    }
     if (s == self.swOffSeatSpeak) {
         kOffSeatSpeak = s.isOn;
         if (g_activeZegoManager) {
