@@ -26,7 +26,7 @@ static dispatch_source_t g_keepAliveTimer = nil;
 // ---------------------- 前置函数声明 ----------------------
 static void ApplyCrystalLoudVoiceDSP(id zegoApi);
 static void StartKeepAliveService(void);
-static UIWindow *GetKeyWindow(void);
+static UIWindow *GetActiveTopWindow(void);
 static void EnsureAllStreamsPlaying(id mgr);
 
 // ---------------------- 接口声明 (严格对齐逆向分析报告) ----------------------
@@ -95,8 +95,10 @@ static void EnsureAllStreamsPlaying(id mgr);
 - (void)clickEmptySeatWithModel:(id)model headerView:(id)headerView;
 @end
 
-// ---------------------- 兼容 iOS 13+ 获取 keyWindow ----------------------
-static UIWindow *GetKeyWindow() {
+// ---------------------- 兼容 iOS 13+ 获取活跃顶层窗口 ----------------------
+static UIWindow *GetActiveTopWindow(void);
+
+static UIWindow *GetActiveTopWindow(void) {
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
@@ -104,30 +106,139 @@ static UIWindow *GetKeyWindow() {
                 for (UIWindow *w in windowScene.windows) {
                     if (w.isKeyWindow) return w;
                 }
+                if (windowScene.windows.count > 0) return windowScene.windows.firstObject;
             }
         }
     }
     return [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
 }
 
-// ---------------------- 融云长连接信令捕获弹窗 ----------------------
-static void ShowCapturedLog(NSString *title, NSString *content) {
-    NSLog(@"[SKWY_RONG_CAPTURED] %@: %@", title, content);
-    [UIPasteboard generalPasteboard].string = content;
+// ---------------------- 信令捕获控制台（持久悬浮日志窗口） ----------------------
+@interface LogInspectorHUD : UIView
+@property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, strong) UILabel *titleLabel;
++ (instancetype)shared;
+- (void)appendLog:(NSString *)tag content:(NSString *)content;
+- (void)showHUD;
+- (void)hideHUD;
+@end
 
+static LogInspectorHUD *g_logHud = nil;
+
+@implementation LogInspectorHUD
+
++ (instancetype)shared {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        g_logHud = [[LogInspectorHUD alloc] initWithFrame:CGRectMake(15, 75, [UIScreen mainScreen].bounds.size.width - 30, 260)];
+    });
+    return g_logHud;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.12 alpha:0.96];
+        self.layer.cornerRadius = 12;
+        self.layer.borderWidth = 1.2;
+        self.layer.borderColor = [UIColor colorWithRed:0.3 green:0.7 blue:1.0 alpha:0.9].CGColor;
+        self.clipsToBounds = YES;
+        self.hidden = YES;
+
+        UIView *topBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, 36)];
+        topBar.backgroundColor = [UIColor colorWithRed:0.15 green:0.18 blue:0.25 alpha:1.0];
+        [self addSubview:topBar];
+
+        self.titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, 140, 24)];
+        self.titleLabel.text = @"信令捕获控制台";
+        self.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        self.titleLabel.textColor = [UIColor colorWithRed:0.4 green:0.8 blue:1.0 alpha:1.0];
+        [topBar addSubview:self.titleLabel];
+
+        UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        copyBtn.frame = CGRectMake(frame.size.width - 125, 5, 55, 26);
+        [copyBtn setTitle:@"一键复制" forState:UIControlStateNormal];
+        copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+        copyBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.95 alpha:1.0];
+        copyBtn.layer.cornerRadius = 5;
+        [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
+        [topBar addSubview:copyBtn];
+
+        UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        clearBtn.frame = CGRectMake(frame.size.width - 65, 5, 55, 26);
+        [clearBtn setTitle:@"清空" forState:UIControlStateNormal];
+        clearBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+        clearBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.3 blue:0.3 alpha:1.0];
+        clearBtn.layer.cornerRadius = 5;
+        [clearBtn addTarget:self action:@selector(clearLog) forControlEvents:UIControlEventTouchUpInside];
+        [topBar addSubview:clearBtn];
+
+        self.textView = [[UITextView alloc] initWithFrame:CGRectMake(5, 38, frame.size.width - 10, frame.size.height - 42)];
+        self.textView.backgroundColor = [UIColor clearColor];
+        self.textView.textColor = [UIColor colorWithRed:0.85 green:0.95 blue:0.85 alpha:1.0];
+        self.textView.font = [UIFont fontWithName:@"Menlo" size:10.5] ?: [UIFont systemFontOfSize:10.5];
+        self.textView.editable = NO;
+        [self addSubview:self.textView];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+        [topBar addGestureRecognizer:pan];
+    }
+    return self;
+}
+
+- (void)appendLog:(NSString *)tag content:(NSString *)content {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-                                                                       message:content
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"已复制" style:UIAlertActionStyleDefault handler:nil]];
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        [fmt setDateFormat:@"HH:mm:ss"];
+        NSString *timeStr = [fmt stringFromDate:[NSDate date]];
 
-        UIWindow *keyWin = GetKeyWindow();
-        if (!keyWin) return;
-        UIViewController *rootVC = keyWin.rootViewController;
-        while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
-        [rootVC presentViewController:alert animated:YES completion:nil];
+        NSString *newEntry = [NSString stringWithFormat:@"[%@] %@:\n%@\n--------------------------------\n", timeStr, tag, content];
+        self.textView.text = [self.textView.text stringByAppendingString:newEntry];
+        [self.textView scrollRangeToVisible:NSMakeRange(self.textView.text.length - 1, 1)];
+
+        NSLog(@"[SKWY_CAPTURE] %@: %@", tag, content);
     });
 }
+
+- (void)showHUD {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = GetActiveTopWindow();
+        if (!win) return;
+        if (self.superview != win) [win addSubview:self];
+        [win bringSubviewToFront:self];
+        self.hidden = NO;
+        self.alpha = 0.0;
+        [UIView animateWithDuration:0.25 animations:^{ self.alpha = 1.0f; }];
+    });
+}
+
+- (void)hideHUD {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.25 animations:^{ self.alpha = 0.0f; } completion:^(BOOL f) { self.hidden = YES; }];
+    });
+}
+
+- (void)copyLog {
+    if (self.textView.text.length > 0) {
+        [UIPasteboard generalPasteboard].string = self.textView.text;
+        self.titleLabel.text = @"已复制到剪贴板";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self.titleLabel.text = @"信令捕获控制台";
+        });
+    }
+}
+
+- (void)clearLog {
+    self.textView.text = @"";
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)p {
+    CGPoint t = [p translationInView:self.superview];
+    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
+    [p setTranslation:CGPointZero inView:self.superview];
+}
+
+@end
 
 // ---------------------- 纯净清晰洪亮调音矩阵 ----------------------
 static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
@@ -233,29 +344,14 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
     NSString *urlStr = request.URL.absoluteString;
 
-    // 抓包调试：捕获所有 /room/ 相关请求并弹窗显示
-    if (kDebugCaptureHTTP && [urlStr containsString:@"/room/"]) {
+    // 抓包调试：捕获所有房间相关请求并显示到控制台
+    if (kDebugCaptureHTTP && urlStr && ([urlStr containsString:@"skwyapp.com"] || [urlStr containsString:@"/room/"] || [urlStr containsString:@"microphone"])) {
         NSString *bodyStr = @"";
         if (request.HTTPBody) {
-            bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+            bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding] ?: @"";
         }
-        NSDictionary *headers = request.allHTTPHeaderFields;
-        NSString *logInfo = [NSString stringWithFormat:@"URL: %@\n\nMethod: %@\n\nHeaders: %@\n\nBody: %@", urlStr, request.HTTPMethod, headers, bodyStr];
-
-        NSLog(@"[SKWY_HOOK_HTTP] %@", logInfo);
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"捕获到房间请求" message:logInfo preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                [UIPasteboard generalPasteboard].string = logInfo;
-            }]];
-            [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-
-            UIWindow *keyWin = GetKeyWindow();
-            UIViewController *rootVC = keyWin.rootViewController;
-            while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
-            [rootVC presentViewController:alert animated:YES completion:nil];
-        });
+        NSString *logInfo = [NSString stringWithFormat:@"URL: %@\nMethod: %@\nHeaders: %@\nBody: %@", urlStr, request.HTTPMethod, request.allHTTPHeaderFields, bodyStr];
+        [[LogInspectorHUD shared] appendLog:@"HTTP网络请求" content:logInfo];
     }
 
     // 拦截下麦/被踢/退出房间请求
@@ -304,10 +400,10 @@ static void EnsureAllStreamsPlaying(id mgrId) {
                  success:(void (^)(void))successBlock
                    error:(void (^)(int status))errorBlock {
 
-    NSString *log = [NSString stringWithFormat:@"【融云上麦/改麦KV】\nroomId: %@\nKey: %@\nValue: %@\nExtra: %@\nsendNotification: %d\nautoDelete: %d", roomId, key, value, extra, sendNotification, autoDelete];
+    NSString *log = [NSString stringWithFormat:@"roomId: %@\nKey: %@\nValue: %@\nExtra: %@\nsendNotification: %d\nautoDelete: %d", roomId, key, value, extra, sendNotification, autoDelete];
 
     if (kDebugCaptureHTTP) {
-        ShowCapturedLog(@"捕获到融云上麦长连接", log);
+        [[LogInspectorHUD shared] appendLog:@"融云-setChatRoomEntry" content:log];
     }
 
     %orig(roomId, key, value, sendNotification, autoDelete, extra, successBlock, errorBlock);
@@ -320,9 +416,8 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 
 - (void)clickEmptySeatWithModel:(id)model headerView:(id)headerView {
     if (kDebugCaptureHTTP) {
-        NSString *modelDesc = [NSString stringWithFormat:@"%@", model];
-        NSString *log = [NSString stringWithFormat:@"【麦位点击触发】\nModel: %@\nHeaderView: %@", modelDesc, headerView];
-        ShowCapturedLog(@"捕获到点击空麦位", log);
+        NSString *log = [NSString stringWithFormat:@"Model: %@\nHeaderView: %@", model, headerView];
+        [[LogInspectorHUD shared] appendLog:@"UI-点击麦位(clickEmptySeat)" content:log];
     }
     %orig(model, headerView);
 }
@@ -391,6 +486,9 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 }
 
 - (void)muteMic:(BOOL)mute {
+    if (kDebugCaptureHTTP) {
+        [[LogInspectorHUD shared] appendLog:@"SKAudioZegoManager" content:[NSString stringWithFormat:@"调用 muteMic: %d", mute]];
+    }
     if (kForceOpenMic || kOffSeatSpeak) {
         %orig(NO);
     } else {
@@ -403,6 +501,9 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 
 // 拦截下麦停推指令
 - (void)stopPublishing {
+    if (kDebugCaptureHTTP) {
+        [[LogInspectorHUD shared] appendLog:@"SKAudioZegoManager" content:@"调用 stopPublishing 停止推流"];
+    }
     if (kOffSeatSpeak || kForceOpenMic) {
         [self muteAllRemote:NO];
         [self enableSpeaker:YES];
@@ -415,6 +516,9 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 }
 
 - (void)startPublishing {
+    if (kDebugCaptureHTTP) {
+        [[LogInspectorHUD shared] appendLog:@"SKAudioZegoManager" content:@"调用 startPublishing 开始推流"];
+    }
     %orig;
     g_activeZegoManager = self;
     if (self.zegoEngine) {
@@ -724,15 +828,10 @@ static void StartKeepAliveService() {
     if (s == self.swDebugCapture) {
         kDebugCaptureHTTP = s.isOn;
         if (s.isOn) {
-            // 开启抓包时提示用户操作 App
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *hint = [UIAlertController alertControllerWithTitle:@"抓包调试已开启" message:@"现在操作房间相关功能（上麦/下麦/踢人等），请求参数将自动弹窗显示并可复制。" preferredStyle:UIAlertControllerStyleAlert];
-                [hint addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
-                UIWindow *keyWin = GetKeyWindow();
-                UIViewController *rootVC = keyWin.rootViewController;
-                while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
-                [rootVC presentViewController:hint animated:YES completion:nil];
-            });
+            [[LogInspectorHUD shared] showHUD];
+            [[LogInspectorHUD shared] appendLog:@"System" content:@"控制台已开启，请进房点击上麦/下麦..."];
+        } else {
+            [[LogInspectorHUD shared] hideHUD];
         }
     }
     if (s == self.swOffSeatSpeak) {
@@ -812,7 +911,7 @@ static NSTimeInterval g_lastTapStamp = 0;
     if (now - g_lastTapStamp < 0.45) return;
     g_lastTapStamp = now;
 
-    UIWindow *targetWindow = GetKeyWindow();
+    UIWindow *targetWindow = GetActiveTopWindow();
     if (!targetWindow) return;
 
     if (!g_hudInstance) {
