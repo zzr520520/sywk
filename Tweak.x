@@ -88,6 +88,11 @@ static void EnsureAllStreamsPlaying(id mgr);
 
 @interface RCChatRoomClient : NSObject
 - (void)quitChatRoom:(NSString *)roomId success:(void (^)(void))successBlock error:(void (^)(int status))errorBlock;
+- (void)setChatRoomEntry:(NSString *)roomId key:(NSString *)key value:(NSString *)value sendNotification:(BOOL)sendNotification autoDelete:(BOOL)autoDelete notificationExtra:(NSString *)extra success:(void (^)(void))successBlock error:(void (^)(int status))errorBlock;
+@end
+
+@interface SWSharePhotosView : UIView
+- (void)clickEmptySeatWithModel:(id)model headerView:(id)headerView;
 @end
 
 // ---------------------- 兼容 iOS 13+ 获取 keyWindow ----------------------
@@ -103,6 +108,25 @@ static UIWindow *GetKeyWindow() {
         }
     }
     return [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
+}
+
+// ---------------------- 融云长连接信令捕获弹窗 ----------------------
+static void ShowCapturedLog(NSString *title, NSString *content) {
+    NSLog(@"[SKWY_RONG_CAPTURED] %@: %@", title, content);
+    [UIPasteboard generalPasteboard].string = content;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                       message:content
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"已复制" style:UIAlertActionStyleDefault handler:nil]];
+
+        UIWindow *keyWin = GetKeyWindow();
+        if (!keyWin) return;
+        UIViewController *rootVC = keyWin.rootViewController;
+        while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
+        [rootVC presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 // ---------------------- 纯净清晰洪亮调音矩阵 ----------------------
@@ -259,7 +283,7 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 
 %end
 
-// ---------------------- 2. 拦截融云聊天室退出 ----------------------
+// ---------------------- 2. 拦截融云聊天室退出 + 麦位 KV 长连接信令捕获 ----------------------
 %hook RCChatRoomClient
 
 - (void)quitChatRoom:(NSString *)roomId success:(void (^)(void))successBlock error:(void (^)(int status))errorBlock {
@@ -268,6 +292,39 @@ static void EnsureAllStreamsPlaying(id mgrId) {
         return;
     }
     %orig(roomId, successBlock, errorBlock);
+}
+
+// v7.9.0: 捕获融云麦位 KV 状态修改（上麦/下麦/锁麦核心长连接接口）
+- (void)setChatRoomEntry:(NSString *)roomId
+                     key:(NSString *)key
+                   value:(NSString *)value
+        sendNotification:(BOOL)sendNotification
+              autoDelete:(BOOL)autoDelete
+       notificationExtra:(NSString *)extra
+                 success:(void (^)(void))successBlock
+                   error:(void (^)(int status))errorBlock {
+
+    NSString *log = [NSString stringWithFormat:@"【融云上麦/改麦KV】\nroomId: %@\nKey: %@\nValue: %@\nExtra: %@\nsendNotification: %d\nautoDelete: %d", roomId, key, value, extra, sendNotification, autoDelete];
+
+    if (kDebugCaptureHTTP) {
+        ShowCapturedLog(@"捕获到融云上麦长连接", log);
+    }
+
+    %orig(roomId, key, value, sendNotification, autoDelete, extra, successBlock, errorBlock);
+}
+
+%end
+
+// ---------------------- 2b. 拦截麦位视图点击事件（上麦 UI 入口） ----------------------
+%hook SWSharePhotosView
+
+- (void)clickEmptySeatWithModel:(id)model headerView:(id)headerView {
+    if (kDebugCaptureHTTP) {
+        NSString *modelDesc = [NSString stringWithFormat:@"%@", model];
+        NSString *log = [NSString stringWithFormat:@"【麦位点击触发】\nModel: %@\nHeaderView: %@", modelDesc, headerView];
+        ShowCapturedLog(@"捕获到点击空麦位", log);
+    }
+    %orig(model, headerView);
 }
 
 %end

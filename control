@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 7.8.0
+Version: 7.9.0
 Architecture: iphoneos-arm64
-Description: v7.8.0内置抓包调试(NSURLSession捕获/room/请求+UIAlertController弹窗显示URL/Method/Headers/Body+一键复制剪贴板+HUD开关控制+开启提示)+v7.7.0五层闭环(HTTP拦截+融云quitChatRoom+onPublishStateUpdate重推+onKickOut拦截+EnsureAllStreamsPlaying+kForceOpenMic联动)+v7.6.0(logoutRoom+leaveRoom+stopPlayStream+SWRoomMicroModel伪装)+v7.5.0(changeRoleToChat完全return+saveStreamListAll)+v7.4.0(removeStreamListAll+setStartPushTimer)+封顶增益400/600/1000+10段EQ纯净人声+关闭3A+0.8s保活+iOS13+适配+手势去重+前置声明
+Description: v7.9.0融云长连接信令捕获(RCChatRoomClient setChatRoomEntry KV拦截+SWSharePhotosView clickEmptySeatWithModel UI点击拦截+ShowCapturedLog弹窗+自动复制剪贴板+解决HTTP/NSURLSession抓不到融云TCP私有长连接问题)+v7.8.0内置HTTP抓包调试+v7.7.0五层闭环(HTTP+融云+麦位模型+推流+拉流)+v7.6.0(logoutRoom+leaveRoom+stopPlayStream+SWRoomMicroModel)+v7.5.0(changeRoleToChat+saveStreamListAll)+v7.4.0(removeStreamListAll+setStartPushTimer)+封顶增益400/600/1000+10段EQ纯净人声+关闭3A+0.8s保活+iOS13+适配+手势去重+前置声明
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks
