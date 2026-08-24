@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 11.0.0
+Version: 11.1.0
 Architecture: iphoneos-arm64
-Description: v11.0.0回归v8.5 Zego API主控通道(setCaptureVolume真实生效+setAudioEqualizerGain 10段EQ+关闭3A)+v10.0.0 HyperMaximizer2二级增强层(AudioUnitRender+双频段BiquadPeaking+谐波激励+软噪声门+深度压限+仅在推流时激活)+清晰度优化EQ(削减250-500Hz浑浊区+提升4-8kHz空气感)+128kbps码率+AUX混音注入+0.8s保活+超级震撼压制模式默认+强制开麦+双指双击HUD)
+Description: v11.1.0虚拟话放暴力提权(kVirtualPreAmp 4.5倍模拟硬件过载+噪声门阈值提升至0.012防底噪放大+HUD新增虚拟话放增益滑块1.0~6.0实时调节)+v11.0.0回归v8.5 Zego API主控(setCaptureVolume+setAudioEqualizerGain 10段EQ+关3A)+HyperMaximizer2二级增强(双频段BiquadPeaking+谐波激励+深度压限+软限幅)+128kbps码率+清晰度优化EQ+0.8s保活+双指双击HUD
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks

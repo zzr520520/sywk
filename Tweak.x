@@ -26,6 +26,7 @@ static float kOldFightGain = 800.0f;
 static float kSuperFightGain = 3000.0f;
 static float kVoiceGainRatio = 1.2f;
 static float kHyperDrive = 2.0f;          // HyperMaximizer2 驱动强度
+static float kVirtualPreAmp = 4.5f;       // 虚拟话放暴力提权倍数（模拟硬件过载）
 
 static __weak id g_activeZegoEngine = nil;
 static __weak id g_activeZegoManager = nil;
@@ -84,12 +85,12 @@ static inline void ProcessHyperMastering(HyperMaximizer2 *m, int16_t *samples, u
     const float threshold = 0.040f;
     const float invRatio = 0.066f;
     const float makeUpGain = 4.5f * drive;
-    const float gateThreshold = 0.007f;
+    const float gateThreshold = 0.012f;
     const float gateAttack = 0.08f;
     const float gateRelease = 0.0008f;
 
     for (uint32_t i = 0; i < count; i++) {
-        float in = ((float)samples[i] / 32768.0f) * 1.3f;
+        float in = ((float)samples[i] / 32768.0f) * kVirtualPreAmp;
 
         float inAbs = fabsf(in);
         if (inAbs > m->gate_env) m->gate_env += gateAttack * (inAbs - m->gate_env);
@@ -494,7 +495,7 @@ static NSTimeInterval g_lastTapStamp = 0;
 
         self.debugPageView = [[UIScrollView alloc] initWithFrame:CGRectMake(75, 0, rw, frame.size.height)];
         self.debugPageView.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.94];
-        self.debugPageView.contentSize = CGSizeMake(rw, 340);
+        self.debugPageView.contentSize = CGSizeMake(rw, 400);
         self.debugPageView.hidden = YES;
         [self addSubview:self.debugPageView];
 
@@ -548,7 +549,7 @@ static NSTimeInterval g_lastTapStamp = 0;
 }
 
 - (void)setupDebugPage {
-    NSArray *items = @[@"新清晰音量 (默认400)", @"旧清晰音量 (默认800)", @"超级震撼增益 (至5000)", @"人声动态权重 (至3.0)", @"Hyper驱动强度 (至2.8)"];
+    NSArray *items = @[@"新清晰音量 (默认400)", @"旧清晰音量 (默认800)", @"超级震撼增益 (至5000)", @"人声动态权重 (至3.0)", @"Hyper驱动强度 (至2.8)", @"虚拟话放增益 (1.0~6.0)"];
     for (int i = 0; i < items.count; i++) {
         CGFloat y = 8 + i * 58;
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, self.debugPageView.frame.size.width - 24, 16)];
@@ -564,6 +565,7 @@ static NSTimeInterval g_lastTapStamp = 0;
         if (i == 2) { slider.minimumValue = 500; slider.maximumValue = 5000; slider.value = kSuperFightGain; }
         if (i == 3) { slider.minimumValue = 0.5; slider.maximumValue = 3.0;  slider.value = kVoiceGainRatio; }
         if (i == 4) { slider.minimumValue = 1.0; slider.maximumValue = 2.8;  slider.value = kHyperDrive; }
+        if (i == 5) { slider.minimumValue = 1.0; slider.maximumValue = 6.0;  slider.value = kVirtualPreAmp; }
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
     }
@@ -580,6 +582,7 @@ static NSTimeInterval g_lastTapStamp = 0;
     if (s.tag == 502) kSuperFightGain = s.value;
     if (s.tag == 503) kVoiceGainRatio = s.value;
     if (s.tag == 504) kHyperDrive = s.value;
+    if (s.tag == 505) kVirtualPreAmp = s.value;
     ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
 }
 
