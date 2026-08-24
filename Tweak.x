@@ -167,7 +167,7 @@ static void GeneratePulseInterferencePCM(short *buffer, int samples, int sampleR
         *pDataLen = maxBytes;
         return;
     }
-    %orig(pData, pDataLen, pSampleRate, channelCount);
+    %orig(pData, pDataLen, pSampleRate, pChannelCount);
 }
 
 %end
