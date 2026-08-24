@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 8.2.0
+Version: 8.3.0
 Architecture: iphoneos-arm64
-Description: v8.2.0麦位字典篡改(SWRoomMicroModel initWithDict强制state=1+type=0防下麦掐断)+SKAudioZegoManager全链路锁定(muteMic拦截/stopPublishing重启/muteAllRemote强制NO)+ZegoAudioRoomApi底层防停流(stopPublish拦截/enableMic强制YES)+0.8s保活守护+封顶增益400/600/1000+10段EQ+关闭3A+iOS13+适配+双指双击HUD
+Description: v8.3.0全场声压压制(setPlayVolume:ofStream:远端流压缩至25%+Ducking自动闪避)+脉冲断续干扰(120ms高速频闪定时器0/80切换+电音撕裂吞字)+双独立开关+移除台下麦+强制开麦+封顶增益400/600/1000+10段EQ+关闭3A+0.8s保活+iOS13+适配+双指双击HUD
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks
