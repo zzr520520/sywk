@@ -1,52 +1,56 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
+#import <math.h>
 
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
     FightMode_New,      // 新清晰 (400 增益 + 齿音穿透)
-    FightMode_Old,      // 旧清晰 (600 增益 + 饱满洪亮)
-    FightMode_Super     // 超级清晰 (1000 封顶增益 + 极致清晰洪亮)
+    FightMode_Old,      // 旧清晰 (800 增益 + 饱满洪亮)
+    FightMode_Super     // 震撼超级压制 (3000~5000 增益 + 广播级胸腔震撼共鸣 + 极致清晰)
 } FightAudioMode;
 
-static BOOL kForceOpenMic = YES;       // 强制开麦
-static BOOL kAudioSuppression = YES;   // 声压绝对压制（我声最大）
-static BOOL kAudioJitterJammer = NO;   // 脉冲断续干扰（让其他人讲话卡顿）
-static FightAudioMode kCurrentFightMode = FightMode_New;
+static BOOL kForceOpenMic = YES;          // 强制开麦
+static BOOL kAudioInjection = NO;         // 全局音频信号注入
+static FightAudioMode kCurrentFightMode = FightMode_Super;
 
 static float kNewFightGain = 400.0f;
-static float kOldFightGain = 600.0f;
-static float kSuperFightGain = 1000.0f;
-static float kVoiceGainRatio = 1.0f;
+static float kOldFightGain = 800.0f;
+static float kSuperFightGain = 3000.0f;   // 默认超级增益提至 3000
+static float kVoiceGainRatio = 1.2f;
 
 static __weak id g_activeZegoEngine = nil;
 static __weak id g_activeZegoManager = nil;
 static dispatch_source_t g_keepAliveTimer = nil;
-static dispatch_source_t g_jammerTimer = nil;
-static BOOL g_jammerState = NO;
 
-// ---------------------- 接口声明 (严格对齐逆向报告) ----------------------
+// ---------------------- 接口声明 (严格对齐逆向分析报告) ----------------------
 @interface ZegoAudioRoomApi : NSObject
 - (void)setCaptureVolume:(int)volume;
 - (BOOL)enableMic:(BOOL)enable;
 - (BOOL)enableSpeaker:(BOOL)enable;
-- (BOOL)setPlayVolume:(int)volume ofStream:(NSString *)streamID;
-- (BOOL)setPlayVolume:(int)volume;
+- (BOOL)enableAux:(BOOL)enable;
+- (BOOL)setAuxVolume:(int)volume;
+- (BOOL)setAudioEqualizerGain:(float)gain index:(int)index;
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
 - (bool)enableAEC:(bool)enable;
-- (bool)setAudioEqualizerGain:(float)gain index:(int)index;
+@end
+
+@interface ZegoAudioAux : NSObject
+- (void)onAuxData:(void *)pData dataLen:(int *)pDataLen sampleRate:(int *)pSampleRate channelCount:(int *)pChannelCount;
 @end
 
 @interface SKAudioZegoManager : NSObject
 + (instancetype)sharedManager;
 @property (nonatomic, strong) ZegoAudioRoomApi *zegoEngine;
+@property (nonatomic, strong) ZegoAudioAux *audioAux;
 @property (nonatomic, strong) NSArray *allStreamList;
 - (void)muteMic:(BOOL)mute;
 - (void)muteAllRemote:(BOOL)mute;
 - (BOOL)enableSpeaker:(BOOL)enable;
+- (void)startPublishing;
 @end
 
-// ---------------------- 纯净清晰洪亮调音 ----------------------
+// ---------------------- 广播级震撼洪亮母带调音矩阵 ----------------------
 static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if (!zegoApi) return;
 
@@ -68,6 +72,7 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
         return;
     }
 
+    // 彻底关停 3A 压制，释放无压缩动态
     if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
     if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
     if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
@@ -83,6 +88,7 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
 
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
         if (kCurrentFightMode == FightMode_New) {
+            // 清晰穿透
             [zegoApi setAudioEqualizerGain:-12.0f index:0];
             [zegoApi setAudioEqualizerGain:-8.0f  index:1];
             [zegoApi setAudioEqualizerGain:0.0f   index:2];
@@ -94,82 +100,79 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
             [zegoApi setAudioEqualizerGain:16.0f  index:8];
             [zegoApi setAudioEqualizerGain:10.0f  index:9];
         } else if (kCurrentFightMode == FightMode_Old) {
-            [zegoApi setAudioEqualizerGain:-8.0f  index:0];
-            [zegoApi setAudioEqualizerGain:-4.0f  index:1];
-            [zegoApi setAudioEqualizerGain:4.0f   index:2];
-            [zegoApi setAudioEqualizerGain:-4.0f  index:3];
-            [zegoApi setAudioEqualizerGain:-6.0f  index:4];
+            // 饱满浑厚
+            [zegoApi setAudioEqualizerGain:-4.0f  index:0];
+            [zegoApi setAudioEqualizerGain:8.0f   index:1];
+            [zegoApi setAudioEqualizerGain:12.0f  index:2];
+            [zegoApi setAudioEqualizerGain:0.0f   index:3];
+            [zegoApi setAudioEqualizerGain:-2.0f  index:4];
             [zegoApi setAudioEqualizerGain:18.0f  index:5];
             [zegoApi setAudioEqualizerGain:24.0f  index:6];
             [zegoApi setAudioEqualizerGain:24.0f  index:7];
             [zegoApi setAudioEqualizerGain:18.0f  index:8];
             [zegoApi setAudioEqualizerGain:12.0f  index:9];
         } else if (kCurrentFightMode == FightMode_Super) {
-            [zegoApi setAudioEqualizerGain:0.0f   index:0];
-            [zegoApi setAudioEqualizerGain:4.0f   index:1];
-            [zegoApi setAudioEqualizerGain:8.0f   index:2];
-            [zegoApi setAudioEqualizerGain:-2.0f  index:3];
-            [zegoApi setAudioEqualizerGain:-4.0f  index:4];
-            [zegoApi setAudioEqualizerGain:24.0f  index:5];
-            [zegoApi setAudioEqualizerGain:24.0f  index:6];
-            [zegoApi setAudioEqualizerGain:24.0f  index:7];
-            [zegoApi setAudioEqualizerGain:24.0f  index:8];
-            [zegoApi setAudioEqualizerGain:20.0f  index:9];
+            // 【震撼超级压制模式】：低频胸腔共鸣增强 + 核心中频力量 + 极致齿音咬字穿透
+            [zegoApi setAudioEqualizerGain:6.0f   index:0]; // 31Hz 超低频微增
+            [zegoApi setAudioEqualizerGain:16.0f  index:1]; // 62Hz 冲击力
+            [zegoApi setAudioEqualizerGain:20.0f  index:2]; // 125Hz 胸腔厚重共鸣 (关键洪亮频段)
+            [zegoApi setAudioEqualizerGain:14.0f  index:3]; // 250Hz 人声基音饱满
+            [zegoApi setAudioEqualizerGain:8.0f   index:4]; // 500Hz 力量感
+            [zegoApi setAudioEqualizerGain:24.0f  index:5]; // 1kHz 咬字清晰
+            [zegoApi setAudioEqualizerGain:24.0f  index:6]; // 2kHz 穿透压制 (封顶)
+            [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz 声学掩蔽 (封顶)
+            [zegoApi setAudioEqualizerGain:20.0f  index:8]; // 8kHz 泛音明亮
+            [zegoApi setAudioEqualizerGain:16.0f  index:9]; // 16kHz 空气感
         }
     }
 }
 
-// ---------------------- 核心 1：全场声压压制与脉冲断续调度 ----------------------
-static void ProcessRoomAudioInterference(SKAudioZegoManager *mgr) {
-    if (!mgr || !mgr.zegoEngine) return;
+// ---------------------- 生成强穿透脉冲 PCM 音频数据 ----------------------
+static void GeneratePulseInterferencePCM(short *buffer, int samples, int sampleRate) {
+    static double phase = 0.0;
+    static int pulseCounter = 0;
+    double freq = 2400.0;
+    double phaseInc = 2.0 * M_PI * freq / (double)sampleRate;
 
-    NSArray *streams = mgr.allStreamList;
-    if (![streams isKindOfClass:[NSArray class]]) return;
+    pulseCounter++;
+    BOOL isPulseOn = (pulseCounter % 40 < 20);
 
-    for (id item in streams) {
-        NSString *streamID = nil;
-        if ([item isKindOfClass:[NSString class]]) {
-            streamID = (NSString *)item;
-        } else if ([item respondsToSelector:@selector(streamID)]) {
-            streamID = [item performSelector:@selector(streamID)];
-        }
-
-        if (streamID && streamID.length > 0) {
-            if (kAudioJitterJammer) {
-                // 脉冲断续干扰：以高频在 0 和 80 间切换，造成吞字与电音撕裂
-                int jammerVol = g_jammerState ? 80 : 0;
-                [mgr.zegoEngine setPlayVolume:jammerVol ofStream:streamID];
-            } else if (kAudioSuppression) {
-                // 声压绝对压制：压低全房间其他人声音至 25%，凸显自己声音绝对最大
-                [mgr.zegoEngine setPlayVolume:25 ofStream:streamID];
-            } else {
-                [mgr.zegoEngine setPlayVolume:100 ofStream:streamID];
-            }
+    for (int i = 0; i < samples; i++) {
+        if (isPulseOn) {
+            buffer[i] = (short)(sin(phase) * 28000.0);
+            phase += phaseInc;
+            if (phase >= 2.0 * M_PI) phase -= 2.0 * M_PI;
+        } else {
+            buffer[i] = 0;
         }
     }
 }
 
-// ---------------------- 核心 2：高速脉冲干扰发生器 ----------------------
-static void SetupJammerTimer() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
-        g_jammerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-        // 120毫秒高速脉冲频闪
-        dispatch_source_set_timer(g_jammerTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.12 * NSEC_PER_SEC), 0);
-        dispatch_source_set_event_handler(g_jammerTimer, ^{
-            if (kAudioJitterJammer && g_activeZegoManager) {
-                g_jammerState = !g_jammerState;
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    ProcessRoomAudioInterference((SKAudioZegoManager *)g_activeZegoManager);
-                });
-            }
-        });
-        dispatch_resume(g_jammerTimer);
-    });
+// ---------------------- AUX 混音注入通道 Hook ----------------------
+%hook ZegoAudioAux
+
+- (void)onAuxData:(void *)pData dataLen:(int *)pDataLen sampleRate:(int *)pSampleRate channelCount:(int *)pChannelCount {
+    if (kAudioInjection && pData && pDataLen) {
+        int rate = 44100;
+        int channels = 1;
+        int maxBytes = *pDataLen;
+        if (maxBytes <= 0) maxBytes = 2048;
+
+        int samples = maxBytes / sizeof(short);
+        short *pcmBuf = (short *)pData;
+        GeneratePulseInterferencePCM(pcmBuf, samples, rate);
+
+        if (pSampleRate) *pSampleRate = rate;
+        if (pChannelCount) *pChannelCount = channels;
+        *pDataLen = maxBytes;
+        return;
+    }
+    %orig(pData, pDataLen, pSampleRate, channelCount);
 }
 
-// ---------------------- Hook 业务与底层 SDK ----------------------
+%end
+
+// ---------------------- 业务音频管理器 Hook ----------------------
 %hook SKAudioZegoManager
 
 - (id)init {
@@ -183,6 +186,10 @@ static void SetupJammerTimer() {
     g_activeZegoManager = self;
     if (self.zegoEngine) {
         g_activeZegoEngine = self.zegoEngine;
+        if ([self.zegoEngine respondsToSelector:@selector(enableAux:)]) {
+            [self.zegoEngine enableAux:kAudioInjection];
+            [self.zegoEngine setAuxVolume:100];
+        }
     }
 }
 
@@ -202,6 +209,10 @@ static void SetupJammerTimer() {
     g_activeZegoManager = self;
     if (self.zegoEngine) {
         g_activeZegoEngine = self.zegoEngine;
+        if ([self.zegoEngine respondsToSelector:@selector(enableAux:)]) {
+            [self.zegoEngine enableAux:kAudioInjection];
+            [self.zegoEngine setAuxVolume:100];
+        }
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
@@ -246,19 +257,21 @@ static void StartKeepAliveService() {
         g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
         dispatch_source_set_event_handler(g_keepAliveTimer, ^{
-            if (g_activeZegoEngine && kCurrentFightMode != FightMode_Normal) {
+            if (g_activeZegoEngine) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
-                });
-            }
-            if (g_activeZegoManager && (kAudioSuppression || kAudioJitterJammer)) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    ProcessRoomAudioInterference((SKAudioZegoManager *)g_activeZegoManager);
+                    if (kCurrentFightMode != FightMode_Normal) {
+                        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+                    }
+                    if ([g_activeZegoEngine respondsToSelector:@selector(enableAux:)]) {
+                        [g_activeZegoEngine enableAux:kAudioInjection];
+                        if (kAudioInjection) {
+                            [g_activeZegoEngine setAuxVolume:100];
+                        }
+                    }
                 });
             }
         });
         dispatch_resume(g_keepAliveTimer);
-        SetupJammerTimer();
     });
 }
 
@@ -281,8 +294,7 @@ static UIWindow *GetKeyWindow(void) {
 @property (nonatomic, strong) UIScrollView *debugPageView;
 
 @property (nonatomic, strong) UISwitch *swForceMic;
-@property (nonatomic, strong) UISwitch *swSuppression;
-@property (nonatomic, strong) UISwitch *swJammer;
+@property (nonatomic, strong) UISwitch *swInjection;
 @property (nonatomic, strong) UISwitch *swNewFight;
 @property (nonatomic, strong) UISwitch *swOldFight;
 @property (nonatomic, strong) UISwitch *swSuperFight;
@@ -324,7 +336,7 @@ static UIWindow *GetKeyWindow(void) {
 
         self.debugPageView = [[UIScrollView alloc] initWithFrame:CGRectMake(75, 0, rw, frame.size.height)];
         self.debugPageView.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.94];
-        self.debugPageView.contentSize = CGSizeMake(rw, 280);
+        self.debugPageView.contentSize = CGSizeMake(rw, 290);
         self.debugPageView.hidden = YES;
         [self addSubview:self.debugPageView];
 
@@ -350,7 +362,7 @@ static UIWindow *GetKeyWindow(void) {
     proc.clipsToBounds = YES;
     [self.funcPageView addSubview:proc];
 
-    NSArray *titles = @[@"强制开麦", @"全场声压压制", @"脉冲断续干扰", @"新清晰效果", @"旧清晰效果", @"超级清晰效果"];
+    NSArray *titles = @[@"强制开麦", @"全房信号注入(广播)", @"屏蔽滋啦杂音", @"新清晰效果", @"旧清晰效果", @"超级震撼压制"];
     for (int i = 0; i < titles.count; i++) {
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8, 30 + i * 32, self.funcPageView.frame.size.width - 16, 28)];
         row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
@@ -369,16 +381,15 @@ static UIWindow *GetKeyWindow(void) {
         [row addSubview:sw];
 
         if (i == 0) { self.swForceMic = sw; [sw setOn:kForceOpenMic]; }
-        if (i == 1) { self.swSuppression = sw; [sw setOn:kAudioSuppression]; }
-        if (i == 2) { self.swJammer = sw; [sw setOn:kAudioJitterJammer]; }
-        if (i == 3) { self.swNewFight = sw; [sw setOn:YES]; }
+        if (i == 1) { self.swInjection = sw; [sw setOn:kAudioInjection]; }
+        if (i == 3) self.swNewFight = sw;
         if (i == 4) self.swOldFight = sw;
-        if (i == 5) self.swSuperFight = sw;
+        if (i == 5) { self.swSuperFight = sw; [sw setOn:YES]; } // 默认开启超级震撼压制
     }
 }
 
 - (void)setupDebugPage {
-    NSArray *items = @[@"新清晰音量 (默认400)", @"旧清晰音量 (默认600)", @"超级清晰音量 (默认1000)", @"人声音量权重"];
+    NSArray *items = @[@"新清晰音量 (默认400)", @"旧清晰音量 (默认800)", @"超级震撼增益 (开放至5000)", @"人声动态权重 (放大至3.0)"];
     for (int i = 0; i < items.count; i++) {
         CGFloat y = 8 + i * 58;
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, self.debugPageView.frame.size.width - 24, 16)];
@@ -389,10 +400,10 @@ static UIWindow *GetKeyWindow(void) {
 
         UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(12, y + 18, self.debugPageView.frame.size.width - 24, 20)];
         slider.tag = 500 + i;
-        if (i == 0) { slider.minimumValue = 100; slider.maximumValue = 800;  slider.value = kNewFightGain; }
-        if (i == 1) { slider.minimumValue = 300; slider.maximumValue = 1200; slider.value = kOldFightGain; }
-        if (i == 2) { slider.minimumValue = 500; slider.maximumValue = 2000; slider.value = kSuperFightGain; }
-        if (i == 3) { slider.minimumValue = 0.5; slider.maximumValue = 2.0;  slider.value = kVoiceGainRatio; }
+        if (i == 0) { slider.minimumValue = 100; slider.maximumValue = 1000; slider.value = kNewFightGain; }
+        if (i == 1) { slider.minimumValue = 300; slider.maximumValue = 1500; slider.value = kOldFightGain; }
+        if (i == 2) { slider.minimumValue = 500; slider.maximumValue = 5000; slider.value = kSuperFightGain; } // 上限开放至 5000
+        if (i == 3) { slider.minimumValue = 0.5; slider.maximumValue = 3.0;  slider.value = kVoiceGainRatio; }   // 权重上限开放至 3.0
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
     }
@@ -413,13 +424,14 @@ static UIWindow *GetKeyWindow(void) {
 
 - (void)onFuncSwitch:(UISwitch *)s {
     if (s == self.swForceMic) kForceOpenMic = s.isOn;
-    if (s == self.swSuppression) {
-        kAudioSuppression = s.isOn;
-        if (g_activeZegoManager) ProcessRoomAudioInterference((SKAudioZegoManager *)g_activeZegoManager);
-    }
-    if (s == self.swJammer) {
-        kAudioJitterJammer = s.isOn;
-        if (g_activeZegoManager) ProcessRoomAudioInterference((SKAudioZegoManager *)g_activeZegoManager);
+    if (s == self.swInjection) {
+        kAudioInjection = s.isOn;
+        if (g_activeZegoEngine && [g_activeZegoEngine respondsToSelector:@selector(enableAux:)]) {
+            [g_activeZegoEngine enableAux:kAudioInjection];
+            if (kAudioInjection) {
+                [g_activeZegoEngine setAuxVolume:100];
+            }
+        }
     }
     if (s == self.swNewFight) {
         if (s.isOn) { kCurrentFightMode = FightMode_New; [self.swOldFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
