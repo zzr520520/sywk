@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 8.5.0
+Version: 9.0.0
 Architecture: iphoneos-arm64
-Description: v8.5.0广播级震撼母带调音链(超级模式默认+3000增益5000封顶+1.2权重3.0上限+125Hz~250Hz胸腔共鸣+16~20dB+1kHz~4kHz顶格+24dB穿透+旧清晰增益升至800+AUX混音注入全房广播+2400Hz脉冲PCM+强制开麦+关闭3A+0.8s保活+iOS13+双指双击HUD)
+Description: v9.0.0物理级PCM暴增益架构(AudioUnitRender底层C函数MSHookFunction+16bit采样点乘法放大+1~30倍可调+tanh软限幅压限曲线+绕过即构setCaptureVolume:100钳位+关闭3A+EQ胸腔共鸣+6倍纯净模式/极限制霸模式双选+强制开麦+双指双击HUD)
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks
