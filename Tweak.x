@@ -44,6 +44,7 @@ static void EnsureAllStreamsPlaying(id mgr);
 - (bool)enableAEC:(bool)enable;
 - (bool)setAudioEqualizerGain:(float)gain index:(int)index;
 - (BOOL)logoutRoom;
+- (BOOL)loginRoom:(NSString *)roomID completionBlock:(id)block;
 @end
 
 @interface SKAudioZegoManager : NSObject
@@ -80,10 +81,18 @@ static void EnsureAllStreamsPlaying(id mgr);
 @interface SWRoomMicroModel : NSObject
 @property (nonatomic, assign) NSInteger microphoneIndex;
 @property (nonatomic, copy) NSString *userId;
+- (id)initWithDict:(NSDictionary *)dict;
 - (BOOL)isDownMicCommand;
 - (BOOL)isOnMicroOperate;
 - (BOOL)isUpableMicro;
 - (BOOL)isCurrentUser;
+@end
+
+@interface AFHTTPSessionManager : NSObject
+- (id)POST:(NSString *)URLString parameters:(id)parameters headers:(NSDictionary *)headers progress:(id)uploadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure;
+- (id)POST:(NSString *)URLString parameters:(id)parameters progress:(id)uploadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure;
+- (id)GET:(NSString *)URLString parameters:(id)parameters headers:(NSDictionary *)headers progress:(id)downloadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure;
+- (id)GET:(NSString *)URLString parameters:(id)parameters progress:(id)downloadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure;
 @end
 
 @interface RCChatRoomClient : NSObject
@@ -379,6 +388,43 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 
 %end
 
+// ---------------------- 1b. 拦截 AFNetworking 网络请求（捕获上麦 HTTP 请求真实参数） ----------------------
+%hook AFHTTPSessionManager
+
+- (id)POST:(NSString *)URLString parameters:(id)parameters headers:(NSDictionary *)headers progress:(id)uploadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure {
+    if (kDebugCaptureHTTP) {
+        NSString *info = [NSString stringWithFormat:@"URL: %@\nMethod: POST\nParams: %@\nHeaders: %@", URLString, parameters, headers];
+        [[LogInspectorHUD shared] appendLog:@"AFN-POST(带headers)" content:info];
+    }
+    return %orig(URLString, parameters, headers, uploadProgress, success, failure);
+}
+
+- (id)POST:(NSString *)URLString parameters:(id)parameters progress:(id)uploadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure {
+    if (kDebugCaptureHTTP) {
+        NSString *info = [NSString stringWithFormat:@"URL: %@\nMethod: POST\nParams: %@", URLString, parameters];
+        [[LogInspectorHUD shared] appendLog:@"AFN-POST(旧版)" content:info];
+    }
+    return %orig(URLString, parameters, uploadProgress, success, failure);
+}
+
+- (id)GET:(NSString *)URLString parameters:(id)parameters headers:(NSDictionary *)headers progress:(id)downloadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure {
+    if (kDebugCaptureHTTP) {
+        NSString *info = [NSString stringWithFormat:@"URL: %@\nMethod: GET\nParams: %@\nHeaders: %@", URLString, parameters, headers];
+        [[LogInspectorHUD shared] appendLog:@"AFN-GET(带headers)" content:info];
+    }
+    return %orig(URLString, parameters, headers, downloadProgress, success, failure);
+}
+
+- (id)GET:(NSString *)URLString parameters:(id)parameters progress:(id)downloadProgress success:(void (^)(id task, id responseObject))success failure:(void (^)(id task, NSError *error))failure {
+    if (kDebugCaptureHTTP) {
+        NSString *info = [NSString stringWithFormat:@"URL: %@\nMethod: GET\nParams: %@", URLString, parameters];
+        [[LogInspectorHUD shared] appendLog:@"AFN-GET(旧版)" content:info];
+    }
+    return %orig(URLString, parameters, downloadProgress, success, failure);
+}
+
+%end
+
 // ---------------------- 2. 拦截融云聊天室退出 + 麦位 KV 长连接信令捕获 ----------------------
 %hook RCChatRoomClient
 
@@ -426,6 +472,13 @@ static void EnsureAllStreamsPlaying(id mgrId) {
 
 // ---------------------- 3. 麦位本地模型状态伪装（报告 4.3 节） ----------------------
 %hook SWRoomMicroModel
+
+- (id)initWithDict:(NSDictionary *)dict {
+    if (kDebugCaptureHTTP) {
+        [[LogInspectorHUD shared] appendLog:@"麦位模型-initWithDict" content:[NSString stringWithFormat:@"Dict数据: %@", dict]];
+    }
+    return %orig(dict);
+}
 
 - (BOOL)isDownMicCommand {
     if (kOffSeatSpeak || kForceOpenMic) return NO;
@@ -611,6 +664,29 @@ static void EnsureAllStreamsPlaying(id mgrId) {
     id inst = %orig;
     g_activeZegoEngine = inst;
     return inst;
+}
+
+- (BOOL)loginRoom:(NSString *)roomID completionBlock:(id)block {
+    if (kDebugCaptureHTTP) {
+        [[LogInspectorHUD shared] appendLog:@"即构底层引擎" content:[NSString stringWithFormat:@"loginRoom: %@", roomID]];
+    }
+    return %orig(roomID, block);
+}
+
+- (BOOL)startPublish {
+    if (kDebugCaptureHTTP) {
+        [[LogInspectorHUD shared] appendLog:@"即构底层引擎" content:@"startPublish (默认流)"];
+    }
+    g_activeZegoEngine = self;
+    return %orig;
+}
+
+- (BOOL)startPublishWithStreamID:(NSString *)streamID {
+    if (kDebugCaptureHTTP) {
+        [[LogInspectorHUD shared] appendLog:@"即构底层引擎" content:[NSString stringWithFormat:@"startPublishWithStreamID: %@", streamID]];
+    }
+    g_activeZegoEngine = self;
+    return %orig(streamID);
 }
 
 - (BOOL)logoutRoom {
