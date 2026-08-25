@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 13.0.0
+Version: 15.0.0
 Architecture: iphoneos-arm64
-Description: v13.0.0 Studio One机架级磁力电流冲击波(动态人声联动58Hz亚低频冲击波+116Hz磁力电流共振+Saturn2电子管饱和+5000极限声压+4000冲击波能量+双轨混音+软限幅防爆音+128kbps全频带+双声道立体声+10段机架EQ+噪声门静音+0.8s保活+双指双击HUD)
+Description: v15.0.0 终极炸裂版(电锯撕裂算法0.85阈值斜率陡增2.2倍+85%极高密度湿声覆盖+7.5倍极限补偿增益+纯方波58Hz地震冲击波+116Hz磁力方波+AUX混音通道+5000封顶人声+4000冲击波能量+10段EQ+关3A+128kbps+Hyper二级增强+完整保留全部开关与滑块+0.8s保活+双指双击HUD)
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks
