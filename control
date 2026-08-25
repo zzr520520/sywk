@@ -1,8 +1,8 @@
 Package: com.hwc.fightvoicepro
 Name: 声控物语搏击音效
-Version: 12.0.0
+Version: 13.0.0
 Architecture: iphoneos-arm64
-Description: v12.0.0 模拟电脑声卡模式(128kbps全频带音乐场景+双声道立体声驱动+立体声展宽+高频泛音空气感+宽带胸腔压迫感+HUD新增PC声卡三参数滑块实时调节)+v11.1.0虚拟话放暴力提权+v11.0.0 Zego API主控+HyperMaximizer2二级增强+0.8s保活+双指双击HUD
+Description: v13.0.0 Studio One机架级磁力电流冲击波(动态人声联动58Hz亚低频冲击波+116Hz磁力电流共振+Saturn2电子管饱和+5000极限声压+4000冲击波能量+双轨混音+软限幅防爆音+128kbps全频带+双声道立体声+10段机架EQ+噪声门静音+0.8s保活+双指双击HUD)
 Maintainer: CustomDev
 Author: CustomDev
 Section: Tweaks

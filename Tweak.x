@@ -4,59 +4,48 @@
 #import <AudioToolbox/AudioToolbox.h>
 
 // ========================================================================
-// v12.0.0: v8.5 Zego API 主控 + v10.0.0 HyperMaximizer2 + v12.0 PC 声卡模拟层
-// 核心策略：setCaptureVolume + setAudioEqualizerGain + 关3A = 主力生效通道
-//          AudioUnitRender HyperMaximizer2 = 二级增强
-//          PCSoundCardMode = PC 端大声卡直推模拟（宽带胸腔 + 高频泛音 + 立体声展宽）
+// 声控物语搏击音效插件 v13.0.0 (Studio One 机架级：磁力电流冲击波)
+// 核心特性：讲话瞬间触发 50Hz 亚低频冲击波 + 磁力电流饱和 + 5000 极限声压
 // ========================================================================
 
 typedef enum : NSUInteger {
     FightMode_Normal = 0,
-    FightMode_New,         // 新清晰 (400 增益 + 齿音穿透)
-    FightMode_Old,         // 旧清晰 (800 增益 + 饱满洪亮)
-    FightMode_Super        // 震撼超级压制 (3000~5000 + 胸腔共鸣 + 极致清晰)
+    FightMode_BroadcastLoud, // 广播级清晰
+    FightMode_ShockWave      // 视频同款：磁力电流冲击波轰炸模式
 } FightAudioMode;
 
 static BOOL kForceOpenMic = YES;
-static BOOL kAudioInjection = NO;         // AUX 全房信号注入
-static BOOL kHyperEnhance = YES;          // HyperMaximizer2 二级增强开关
-static BOOL kPCSoundCardMode = NO;        // v12.0 模拟电脑声卡模式
-static FightAudioMode kCurrentFightMode = FightMode_Super;
+static BOOL kAudioInjection = NO;
+static BOOL kShockWaveEnabled = YES;      // 磁力电流冲击波总开关
+static FightAudioMode kCurrentFightMode = FightMode_ShockWave;
 
-static float kNewFightGain = 400.0f;
-static float kOldFightGain = 800.0f;
-static float kSuperFightGain = 3000.0f;
-static float kVoiceGainRatio = 1.2f;
-static float kHyperDrive = 2.0f;          // HyperMaximizer2 驱动强度
-static float kVirtualPreAmp = 4.5f;       // 虚拟话放暴力提权倍数（模拟硬件过载）
-
-// v12.0 PC 声卡模拟参数
-static float kPCSoundCardWidth = 1.6f;    // 立体声展宽系数 (1.0~2.5)
-static float kPCSoundCardAir = 1.0f;      // 高频泛音空气感强度 (0.5~2.0)
-static float kPCSoundCardChest = 1.0f;    // 宽带胸腔压迫感强度 (0.5~2.0)
-static int   kPCSoundCardBitrate = 128000; // PC 声卡模式码率
+static float kVoiceGainRatio = 1.6f;      // 人声增益 (5000 级)
+static float kShockWaveIntensity = 4000.0f;// 冲击波基础能量 (4000 级)
+static float kMagneticDrive = 2.2f;       // 电流磁力饱和度
 
 static __weak id g_activeZegoEngine = nil;
 static __weak id g_activeZegoManager = nil;
 static dispatch_source_t g_keepAliveTimer = nil;
-static BOOL g_isPublishing = NO;          // 推流状态标记
+static BOOL g_isPublishing = NO;
 
 // ========================================================================
-// Part 1: v10.0.0 HyperMaximizer2 双频段母带 DSP（二级增强层）
-// 仅在 AudioUnitRender 拦截到音频时生效，不拦截则完全不影响
+// Part 1: Studio One 机架级 DSP 引擎 (磁力电流 + 动态冲击波合成)
 // ========================================================================
 typedef struct {
-    float env;
     float gate_env;
+    float shock_env;
+    double sub_phase;      // 55Hz 亚低频冲击波相位
+    double current_phase;  // 120Hz 电流磁环相位
+
+    // 双二阶 EQ 状态
     float b0_h, b1_h, b2_h, a1_h, a2_h;
     float x1_h, x2_h, y1_h, y2_h;
     float b0_l, b1_l, b2_l, a1_l, a2_l;
     float x1_l, x2_l, y1_l, y2_l;
-    float sc_x1, sc_y1;
-} HyperMaximizer2;
+} StudioOneRackDSP;
 
-static HyperMaximizer2 g_hyperMax;
-static BOOL g_hyperInited = NO;
+static StudioOneRackDSP g_rackDSP;
+static BOOL g_rackInited = NO;
 
 static inline void CalcBiquadPeaking(float f0, float gainDB, float Q, float sampleRate,
                                      float *b0, float *b1, float *b2, float *a1, float *a2) {
@@ -76,83 +65,98 @@ static inline void CalcBiquadPeaking(float f0, float gainDB, float Q, float samp
     *a2 = a2_tmp / a0_tmp;
 }
 
-static inline void InitHyperMax(HyperMaximizer2 *m, float sampleRate) {
-    memset(m, 0, sizeof(HyperMaximizer2));
-    CalcBiquadPeaking(2800.0f, 12.0f, 1.0f, sampleRate, &m->b0_h, &m->b1_h, &m->b2_h, &m->a1_h, &m->a2_h);
-    CalcBiquadPeaking(120.0f, 6.0f, 1.4f, sampleRate, &m->b0_l, &m->b1_l, &m->b2_l, &m->a1_l, &m->a2_l);
+static inline void InitStudioOneRack(StudioOneRackDSP *m, float sampleRate) {
+    memset(m, 0, sizeof(StudioOneRackDSP));
+    // 2.8kHz 穿透咬字 (+16dB, Q=1.0)
+    CalcBiquadPeaking(2800.0f, 16.0f, 1.0f, sampleRate, &m->b0_h, &m->b1_h, &m->b2_h, &m->a1_h, &m->a2_h);
+    // 80Hz 冲击波能量 (+12dB, Q=1.2)
+    CalcBiquadPeaking(80.0f, 12.0f, 1.2f, sampleRate, &m->b0_l, &m->b1_l, &m->b2_l, &m->a1_l, &m->a2_l);
 }
 
-static inline float ApplyHyperExciter(float x) {
-    float x2 = x * fabsf(x);
-    return x + 0.18f * x2 + 0.04f * x2 * x;
+// 核心算法：磁力电流饱和器 (模拟 Saturn 2 电子管击穿带电质感)
+static inline float ApplyMagneticSaturation(float x, float drive) {
+    float driven = x * drive;
+    // 非对称饱和产生丰富的偶次磁力泛音
+    float magnetic = driven / (1.0f + fabsf(driven));
+    // 注入高频电流脉冲调制
+    float currentHarmonic = 0.25f * (driven * driven * driven - driven);
+    return magnetic + currentHarmonic * 0.15f;
 }
 
-static inline void ProcessHyperMastering(HyperMaximizer2 *m, int16_t *samples, uint32_t count, float drive) {
-    const float attackCoef = 0.06f;
-    const float releaseCoef = 0.0015f;
-    const float threshold = 0.040f;
-    const float invRatio = 0.066f;
-    const float makeUpGain = 4.5f * drive;
-    const float gateThreshold = 0.012f;
-    const float gateAttack = 0.08f;
-    const float gateRelease = 0.0008f;
+static inline void ProcessStudioOneRackMastering(StudioOneRackDSP *m, int16_t *samples, uint32_t count) {
+    const float sampleRate = 44100.0f;
+    const double subFreq = 58.0;      // 58Hz 震撼心跳冲击波频率
+    const double subInc = 2.0 * M_PI * subFreq / sampleRate;
+
+    const double currentFreq = 116.0; // 116Hz 磁力电流共振频
+    const double currentInc = 2.0 * M_PI * currentFreq / sampleRate;
+
+    const float gateThresh = 0.006f;
+    const float gateAttack = 0.12f;   // 极速触发
+    const float gateRelease = 0.001f;
 
     for (uint32_t i = 0; i < count; i++) {
-        float in = ((float)samples[i] / 32768.0f) * kVirtualPreAmp;
+        float rawIn = (float)samples[i] / 32768.0f;
+        float absIn = fabsf(rawIn);
 
-        float inAbs = fabsf(in);
-        if (inAbs > m->gate_env) m->gate_env += gateAttack * (inAbs - m->gate_env);
-        else m->gate_env += gateRelease * (inAbs - m->gate_env);
-        float gateGain = 1.0f;
-        if (m->gate_env < gateThreshold) {
-            gateGain = m->gate_env / gateThreshold;
-            gateGain = gateGain * gateGain;
+        // 1. 人声探测门限 (只要一开口立刻触发)
+        if (absIn > m->gate_env) m->gate_env += gateAttack * (absIn - m->gate_env);
+        else m->gate_env += gateRelease * (absIn - m->gate_env);
+
+        float isSpeaking = 0.0f;
+        if (m->gate_env > gateThresh) {
+            isSpeaking = (m->gate_env - gateThresh) / (0.08f - gateThresh);
+            if (isSpeaking > 1.0f) isSpeaking = 1.0f;
         }
-        float gatedIn = in * gateGain;
 
-        float low_out = m->b0_l * gatedIn + m->b1_l * m->x1_l + m->b2_l * m->x2_l - m->a1_l * m->y1_l - m->a2_l * m->y2_l;
-        m->x2_l = m->x1_l; m->x1_l = gatedIn;
-        m->y2_l = m->y1_l; m->y1_l = low_out;
+        // 2. 生成联动磁力冲击波 (4000 档位能量)
+        float shockWave = 0.0f;
+        if (kShockWaveEnabled && isSpeaking > 0.05f) {
+            float subBass = sin(m->sub_phase);
+            float magneticPulse = sin(m->current_phase);
+            // 冲击波强度由 4000 参数驱动
+            float shockScale = (kShockWaveIntensity / 4000.0f) * 0.45f;
+            shockWave = (subBass * 0.7f + magneticPulse * 0.3f) * shockScale * isSpeaking;
 
-        float full_eq = m->b0_h * low_out + m->b1_h * m->x1_h + m->b2_h * m->x2_h - m->a1_h * m->y1_h - m->a2_h * m->y2_h;
-        m->x2_h = m->x1_h; m->x1_h = low_out;
+            m->sub_phase += subInc;
+            if (m->sub_phase >= 2.0 * M_PI) m->sub_phase -= 2.0 * M_PI;
+            m->current_phase += currentInc;
+            if (m->current_phase >= 2.0 * M_PI) m->current_phase -= 2.0 * M_PI;
+        }
+
+        // 3. 人声主轨母带 EQ + 磁力电流饱和 (5000 档位满格)
+        float gatedVoice = rawIn * isSpeaking * (kVoiceGainRatio * 1.8f);
+
+        float low_eq = m->b0_l * gatedVoice + m->b1_l * m->x1_l + m->b2_l * m->x2_l - m->a1_l * m->y1_l - m->a2_l * m->y2_l;
+        m->x2_l = m->x1_l; m->x1_l = gatedVoice;
+        m->y2_l = m->y1_l; m->y1_l = low_eq;
+
+        float full_eq = m->b0_h * low_eq + m->b1_h * m->x1_h + m->b2_h * m->x2_h - m->a1_h * m->y1_h - m->a2_h * m->y2_h;
+        m->x2_h = m->x1_h; m->x1_h = low_eq;
         m->y2_h = m->y1_h; m->y1_h = full_eq;
 
-        float sc_in = full_eq - m->sc_x1 + 0.98f * m->sc_y1;
-        m->sc_x1 = full_eq;
-        m->sc_y1 = sc_in;
+        // 注入磁力电流饱和
+        float magneticVoice = ApplyMagneticSaturation(full_eq, kMagneticDrive);
 
-        float absVal = fabsf(sc_in);
-        if (absVal > m->env) m->env += attackCoef * (absVal - m->env);
-        else m->env += releaseCoef * (absVal - m->env);
+        // 4. 双轨总混音 (人声 5000 级 + 冲击波 4000 级)
+        float mix = magneticVoice * 0.75f + shockWave * 0.55f;
 
-        float gainReduction = 1.0f;
-        if (m->env > threshold) {
-            float overDB = (m->env - threshold) / threshold;
-            gainReduction = 1.0f / (1.0f + overDB * (1.0f - invRatio));
-        }
-
-        float compressed = full_eq * gainReduction * makeUpGain;
-        float saturated = ApplyHyperExciter(compressed);
-
+        // 5. 广播级前瞻软限幅 (封顶 0.985 防爆音)
         const float ceiling = 0.985f;
-        float out = saturated;
+        float out = mix;
         if (out > ceiling) {
             out = ceiling + (1.0f - ceiling) * tanhf((out - ceiling) / (1.0f - ceiling + 0.001f));
-            if (out > 0.992f) out = 0.992f;
+            if (out > 0.995f) out = 0.995f;
         } else if (out < -ceiling) {
             out = -ceiling - (1.0f - ceiling) * tanhf((-out - ceiling) / (1.0f - ceiling + 0.001f));
-            if (out < -0.992f) out = -0.992f;
+            if (out < -0.995f) out = -0.995f;
         }
 
-        float finalSample = out * 0.92f + gatedIn * 0.08f;
-        if (finalSample > 0.998f) finalSample = 0.998f;
-        if (finalSample < -0.998f) finalSample = -0.998f;
-        samples[i] = (int16_t)(finalSample * 32767.0f);
+        samples[i] = (int16_t)(out * 32767.0f);
     }
 }
 
-// AudioUnitRender 二级增强层（仅在推流时激活，不拦截即构则自动空转）
+// AudioUnitRender 底层音频截获 Hook
 static OSStatus (*orig_AudioUnitRender)(AudioComponentInstance, AudioUnitRenderActionFlags *,
                                         const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
 
@@ -163,18 +167,16 @@ static OSStatus hook_AudioUnitRender(AudioComponentInstance inUnit,
                                      UInt32 inNumberFrames,
                                      AudioBufferList *ioData) {
     OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData);
-    if (status == noErr && ioData != NULL && kHyperEnhance && g_isPublishing &&
-        kCurrentFightMode != FightMode_Normal) {
-        if (!g_hyperInited) {
-            InitHyperMax(&g_hyperMax, 44100.0f);
-            g_hyperInited = YES;
+    if (status == noErr && ioData != NULL && g_isPublishing && kCurrentFightMode == FightMode_ShockWave) {
+        if (!g_rackInited) {
+            InitStudioOneRack(&g_rackDSP, 44100.0f);
+            g_rackInited = YES;
         }
-        float drive = kHyperDrive;
         for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
             int16_t *samples = (int16_t *)ioData->mBuffers[i].mData;
             UInt32 sampleCount = ioData->mBuffers[i].mDataByteSize / sizeof(int16_t);
             if (sampleCount > 0 && samples) {
-                ProcessHyperMastering(&g_hyperMax, samples, sampleCount, drive);
+                ProcessStudioOneRackMastering(&g_rackDSP, samples, sampleCount);
             }
         }
     }
@@ -182,196 +184,76 @@ static OSStatus hook_AudioUnitRender(AudioComponentInstance inUnit,
 }
 
 // ========================================================================
-// Part 2: v8.5 接口声明（Zego SDK 原生 API = 真正生效的通道）
+// Part 2: 即构 SDK 接口声明与电脑级声卡场景
 // ========================================================================
 @interface ZegoAudioRoomApi : NSObject
 - (void)setCaptureVolume:(int)volume;
 - (BOOL)enableMic:(BOOL)enable;
 - (BOOL)enableSpeaker:(BOOL)enable;
-- (BOOL)enableAux:(BOOL)enable;
-- (BOOL)setAuxVolume:(int)volume;
 - (BOOL)setAudioEqualizerGain:(float)gain index:(int)index;
 - (BOOL)setAudioBitrate:(int)bitrate;
+- (BOOL)setAudioScenario:(int)scenario;
+- (BOOL)setAudioChannelCount:(int)count;
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
 - (bool)enableAEC:(bool)enable;
-- (BOOL)setAudioChannelCount:(int)count;          // v12.0 声道数设置
-- (BOOL)setCaptureStereoSideGain:(float)gain;     // v12.0 立体声展宽
-- (BOOL)enableHeadphoneAEC:(BOOL)enable;          // v12.0 耳机回声消除
-- (BOOL)setVoiceChangerParam:(float)param type:(int)type; // v12.0 音效参数
-@end
-
-@interface ZegoAudioAux : NSObject
-- (void)onAuxData:(void *)pData dataLen:(int *)pDataLen sampleRate:(int *)pSampleRate channelCount:(int *)pChannelCount;
 @end
 
 @interface SKAudioZegoManager : NSObject
 + (instancetype)sharedManager;
 @property (nonatomic, strong) ZegoAudioRoomApi *zegoEngine;
-@property (nonatomic, strong) ZegoAudioAux *audioAux;
-@property (nonatomic, strong) NSArray *allStreamList;
 - (void)muteMic:(BOOL)mute;
-- (void)muteAllRemote:(BOOL)mute;
-- (BOOL)enableSpeaker:(BOOL)enable;
 - (void)startPublishing;
 - (void)stopPublishing;
 @end
 
-// ========================================================================
-// Part 3: v8.5 主力调音链（Zego SDK API）+ 清晰度优化 EQ
-// 核心生效路径：setCaptureVolume → setAudioEqualizerGain → 关3A
-// v12.0 新增：PC 声卡模拟层（立体声展宽 + 高频泛音 + 宽带胸腔 + 128kbps 全频带）
-// ========================================================================
-static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
+static void ApplyStudioOneProfile(id zegoApi) {
     if (!zegoApi) return;
 
     if ([zegoApi respondsToSelector:@selector(enableSpeaker:)]) [zegoApi enableSpeaker:YES];
     if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) [zegoApi enableMic:YES];
 
-    if (kCurrentFightMode == FightMode_Normal && !kPCSoundCardMode) {
+    if (kCurrentFightMode == FightMode_Normal) {
         if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
         if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
         if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
         if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
-        if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-            for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
-        }
-        if ([zegoApi respondsToSelector:@selector(setAudioBitrate:)]) {
-            [zegoApi setAudioBitrate:48000];
-        }
         return;
     }
 
-    // 彻底关停 3A 压制（v8.5 核心策略：释放无压缩动态）
+    // 强制电脑专业机架模式：音乐场景 + 双声道立体声 + 128kbps
+    if ([zegoApi respondsToSelector:@selector(setAudioScenario:)]) [zegoApi setAudioScenario:1];
+    if ([zegoApi respondsToSelector:@selector(setAudioChannelCount:)]) [zegoApi setAudioChannelCount:2];
+    if ([zegoApi respondsToSelector:@selector(setAudioBitrate:)]) [zegoApi setAudioBitrate:128000];
+
+    // 关闭 3A 压制，释放无压缩动态
     if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:NO];
     if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:NO];
     if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:NO];
 
-    // 增益计算（v8.5 核心策略：setCaptureVolume 真实生效）
-    float baseGain = kNewFightGain;
-    if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
-    if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-    int finalVolume = (int)(baseGain * kVoiceGainRatio);
+    // 锁定 5000 封顶极限捕捉音量
     if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) {
-        [zegoApi setCaptureVolume:finalVolume];
+        [zegoApi setCaptureVolume:5000];
     }
 
-    // 码率设置：PC 声卡模式强制 128kbps 全频带音乐场景
-    if ([zegoApi respondsToSelector:@selector(setAudioBitrate:)]) {
-        int bitrate = kPCSoundCardMode ? kPCSoundCardBitrate : 128000;
-        [zegoApi setAudioBitrate:bitrate];
-    }
-
-    // v12.0 PC 声卡模拟：双声道立体声驱动
-    if (kPCSoundCardMode) {
-        if ([zegoApi respondsToSelector:@selector(setAudioChannelCount:)]) {
-            [zegoApi setAudioChannelCount:2];  // 强制双声道立体声
-        }
-        if ([zegoApi respondsToSelector:@selector(setCaptureStereoSideGain:)]) {
-            [zegoApi setCaptureStereoSideGain:kPCSoundCardWidth];
-        }
-        if ([zegoApi respondsToSelector:@selector(enableHeadphoneAEC:)]) {
-            [zegoApi enableHeadphoneAEC:NO];  // 解除底噪抑制，释放全频带动态
-        }
-    }
-
-    // AUX 混音注入
-    if ([zegoApi respondsToSelector:@selector(enableAux:)]) {
-        [zegoApi enableAux:kAudioInjection];
-        if (kAudioInjection && [zegoApi respondsToSelector:@selector(setAuxVolume:)]) {
-            [zegoApi setAuxVolume:100];
-        }
-    }
-
-    // 10 段 EQ（清晰度优化版：削减 250-500Hz 浑浊区，提升 4-8kHz 空气感）
+    // 10段机架 EQ：低频重轰炸 + 中高频磁力刺穿
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
-        if (kCurrentFightMode == FightMode_New) {
-            // 新清晰：齿音穿透，中低频适度削减防糊
-            float airBoost = kPCSoundCardMode ? (4.0f * kPCSoundCardAir) : 0.0f;
-            float chestBoost = kPCSoundCardMode ? (2.0f * kPCSoundCardChest) : 0.0f;
-            [zegoApi setAudioEqualizerGain:-10.0f index:0]; // 31Hz
-            [zegoApi setAudioEqualizerGain:-6.0f  index:1]; // 62Hz
-            [zegoApi setAudioEqualizerGain:-2.0f + chestBoost index:2]; // 125Hz
-            [zegoApi setAudioEqualizerGain:-8.0f  index:3]; // 250Hz 削浑浊
-            [zegoApi setAudioEqualizerGain:-10.0f index:4]; // 500Hz 削闷
-            [zegoApi setAudioEqualizerGain:14.0f  index:5]; // 1kHz 咬字
-            [zegoApi setAudioEqualizerGain:22.0f  index:6]; // 2kHz 穿透
-            [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz 极致清晰
-            [zegoApi setAudioEqualizerGain:18.0f + airBoost index:8]; // 8kHz 泛音明亮
-            [zegoApi setAudioEqualizerGain:12.0f + airBoost * 0.8f index:9]; // 16kHz 空气感
-        } else if (kCurrentFightMode == FightMode_Old) {
-            // 旧清晰：饱满浑厚，中低频适度保留
-            float airBoost = kPCSoundCardMode ? (4.0f * kPCSoundCardAir) : 0.0f;
-            float chestBoost = kPCSoundCardMode ? (3.0f * kPCSoundCardChest) : 0.0f;
-            [zegoApi setAudioEqualizerGain:-4.0f  index:0]; // 31Hz
-            [zegoApi setAudioEqualizerGain:6.0f + chestBoost * 0.5f index:1]; // 62Hz
-            [zegoApi setAudioEqualizerGain:10.0f + chestBoost index:2]; // 125Hz 胸腔
-            [zegoApi setAudioEqualizerGain:-2.0f  index:3]; // 250Hz 微削
-            [zegoApi setAudioEqualizerGain:-4.0f  index:4]; // 500Hz 削闷
-            [zegoApi setAudioEqualizerGain:16.0f  index:5]; // 1kHz
-            [zegoApi setAudioEqualizerGain:24.0f  index:6]; // 2kHz
-            [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz
-            [zegoApi setAudioEqualizerGain:20.0f + airBoost index:8]; // 8kHz
-            [zegoApi setAudioEqualizerGain:14.0f + airBoost * 0.8f index:9]; // 16kHz
-        } else if (kCurrentFightMode == FightMode_Super) {
-            // 震撼超级压制：胸腔共鸣 + 极致清晰穿透（清晰度优化版）
-            float airBoost = kPCSoundCardMode ? (6.0f * kPCSoundCardAir) : 0.0f;
-            float chestBoost = kPCSoundCardMode ? (4.0f * kPCSoundCardChest) : 0.0f;
-            [zegoApi setAudioEqualizerGain:4.0f + chestBoost * 0.3f index:0]; // 31Hz 微增
-            [zegoApi setAudioEqualizerGain:12.0f + chestBoost * 0.6f index:1]; // 62Hz 冲击力
-            [zegoApi setAudioEqualizerGain:18.0f + chestBoost index:2]; // 125Hz 胸腔厚重共鸣
-            [zegoApi setAudioEqualizerGain:6.0f + chestBoost * 0.4f index:3]; // 250Hz 适度饱满（降低防浑浊）
-            [zegoApi setAudioEqualizerGain:2.0f   index:4]; // 500Hz 微增（降低防闷）
-            [zegoApi setAudioEqualizerGain:24.0f  index:5]; // 1kHz 咬字清晰（顶格）
-            [zegoApi setAudioEqualizerGain:24.0f  index:6]; // 2kHz 穿透压制（顶格）
-            [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz 声学掩蔽（顶格）
-            [zegoApi setAudioEqualizerGain:22.0f + airBoost index:8]; // 8kHz 泛音明亮（提升清晰度）
-            [zegoApi setAudioEqualizerGain:16.0f + airBoost * 0.8f index:9]; // 16kHz 空气感
-        }
-    }
-}
-
-// AUX 混音 PCM 生成
-static void GeneratePulseInterferencePCM(short *buffer, int samples, int sampleRate) {
-    static double phase = 0.0;
-    static int pulseCounter = 0;
-    double freq = 2400.0;
-    double phaseInc = 2.0 * M_PI * freq / (double)sampleRate;
-    pulseCounter++;
-    BOOL isPulseOn = (pulseCounter % 40 < 20);
-    for (int i = 0; i < samples; i++) {
-        if (isPulseOn) {
-            buffer[i] = (short)(sin(phase) * 28000.0);
-            phase += phaseInc;
-            if (phase >= 2.0 * M_PI) phase -= 2.0 * M_PI;
-        } else {
-            buffer[i] = 0;
-        }
+        [zegoApi setAudioEqualizerGain:14.0f index:0]; // 31Hz 超低频冲击
+        [zegoApi setAudioEqualizerGain:24.0f index:1]; // 62Hz 冲击波轰炸区 (顶格)
+        [zegoApi setAudioEqualizerGain:20.0f index:2]; // 125Hz 磁力共振区
+        [zegoApi setAudioEqualizerGain:8.0f  index:3]; // 250Hz
+        [zegoApi setAudioEqualizerGain:4.0f  index:4]; // 500Hz
+        [zegoApi setAudioEqualizerGain:24.0f index:5]; // 1kHz 咬字清晰 (顶格)
+        [zegoApi setAudioEqualizerGain:24.0f index:6]; // 2kHz 穿透压制 (顶格)
+        [zegoApi setAudioEqualizerGain:24.0f index:7]; // 4kHz 电流声学掩蔽 (顶格)
+        [zegoApi setAudioEqualizerGain:22.0f index:8]; // 8kHz 金属泛音
+        [zegoApi setAudioEqualizerGain:16.0f index:9]; // 16kHz 空气感
     }
 }
 
 // ========================================================================
-// Part 4: v8.5 Hook 层（SKAudioZegoManager + ZegoAudioRoomApi + ZegoAudioAux）
+// Part 3: Hook 层与生命周期
 // ========================================================================
-%hook ZegoAudioAux
-- (void)onAuxData:(void *)pData dataLen:(int *)pDataLen sampleRate:(int *)pSampleRate channelCount:(int *)pChannelCount {
-    if (kAudioInjection && pData && pDataLen) {
-        int rate = 44100;
-        int channels = 1;
-        int maxBytes = *pDataLen;
-        if (maxBytes <= 0) maxBytes = 2048;
-        int samples = maxBytes / sizeof(short);
-        short *pcmBuf = (short *)pData;
-        GeneratePulseInterferencePCM(pcmBuf, samples, rate);
-        if (pSampleRate) *pSampleRate = rate;
-        if (pChannelCount) *pChannelCount = channels;
-        *pDataLen = maxBytes;
-        return;
-    }
-    %orig(pData, pDataLen, pSampleRate, pChannelCount);
-}
-%end
-
 %hook SKAudioZegoManager
 - (id)init {
     id inst = %orig;
@@ -383,14 +265,14 @@ static void GeneratePulseInterferencePCM(short *buffer, int samples, int sampleR
     g_activeZegoManager = self;
     if (self.zegoEngine) {
         g_activeZegoEngine = self.zegoEngine;
-        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+        ApplyStudioOneProfile(g_activeZegoEngine);
     }
 }
 - (void)muteMic:(BOOL)mute {
     if (kForceOpenMic) %orig(NO);
     else %orig(mute);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+        ApplyStudioOneProfile(g_activeZegoEngine);
     });
 }
 - (void)startPublishing {
@@ -399,13 +281,9 @@ static void GeneratePulseInterferencePCM(short *buffer, int samples, int sampleR
     g_activeZegoManager = self;
     if (self.zegoEngine) {
         g_activeZegoEngine = self.zegoEngine;
-        if ([self.zegoEngine respondsToSelector:@selector(enableAux:)]) {
-            [self.zegoEngine enableAux:kAudioInjection];
-            [self.zegoEngine setAuxVolume:100];
-        }
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+        ApplyStudioOneProfile(g_activeZegoEngine);
     });
 }
 - (void)stopPublishing {
@@ -427,11 +305,8 @@ static void GeneratePulseInterferencePCM(short *buffer, int samples, int sampleR
 }
 - (void)setCaptureVolume:(int)volume {
     g_activeZegoEngine = self;
-    if (kCurrentFightMode != FightMode_Normal) {
-        float baseGain = kNewFightGain;
-        if (kCurrentFightMode == FightMode_Old) baseGain = kOldFightGain;
-        if (kCurrentFightMode == FightMode_Super) baseGain = kSuperFightGain;
-        %orig((int)(baseGain * kVoiceGainRatio));
+    if (kCurrentFightMode == FightMode_ShockWave) {
+        %orig(5000); // 强制 5000 顶格
         return;
     }
     %orig(volume);
@@ -439,7 +314,7 @@ static void GeneratePulseInterferencePCM(short *buffer, int samples, int sampleR
 %end
 
 // ========================================================================
-// Part 5: 0.8s 保活守护线程（v8.5 核心：持续重申增益与 EQ 防漂移）
+// Part 4: 保活线程与 HUD 面板
 // ========================================================================
 static void StartKeepAliveService() {
     static dispatch_once_t onceToken;
@@ -448,17 +323,9 @@ static void StartKeepAliveService() {
         g_keepAliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
         dispatch_source_set_timer(g_keepAliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(0.8 * NSEC_PER_SEC), 0);
         dispatch_source_set_event_handler(g_keepAliveTimer, ^{
-            if (g_activeZegoEngine) {
+            if (g_activeZegoEngine && kCurrentFightMode != FightMode_Normal) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    if (kCurrentFightMode != FightMode_Normal) {
-                        ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
-                    }
-                    if ([g_activeZegoEngine respondsToSelector:@selector(enableAux:)]) {
-                        [g_activeZegoEngine enableAux:kAudioInjection];
-                        if (kAudioInjection && [g_activeZegoEngine respondsToSelector:@selector(setAuxVolume:)]) {
-                            [g_activeZegoEngine setAuxVolume:100];
-                        }
-                    }
+                    ApplyStudioOneProfile(g_activeZegoEngine);
                 });
             }
         });
@@ -466,9 +333,6 @@ static void StartKeepAliveService() {
     });
 }
 
-// ========================================================================
-// Part 6: HUD 控制面板（v8.5 布局 + v10.0.0 Hyper 驱动滑块）
-// ========================================================================
 static UIWindow *GetKeyWindow(void) {
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -486,12 +350,10 @@ static UIWindow *GetKeyWindow(void) {
 @property (nonatomic, strong) UIView *funcPageView;
 @property (nonatomic, strong) UIScrollView *debugPageView;
 @property (nonatomic, strong) UISwitch *swForceMic;
-@property (nonatomic, strong) UISwitch *swInjection;
-@property (nonatomic, strong) UISwitch *swHyper;
-@property (nonatomic, strong) UISwitch *swPCSoundCard;  // v12.0 模拟电脑声卡
-@property (nonatomic, strong) UISwitch *swNewFight;
-@property (nonatomic, strong) UISwitch *swOldFight;
-@property (nonatomic, strong) UISwitch *swSuperFight;
+@property (nonatomic, strong) UISwitch *swShockWave;
+@property (nonatomic, strong) UISwitch *swShockMode;
+@property (nonatomic, strong) UILabel *lblShock;
+@property (nonatomic, strong) UILabel *lblVoice;
 @end
 
 static BattleMasterHUD *g_hudInstance = nil;
@@ -501,24 +363,28 @@ static NSTimeInterval g_lastTapStamp = 0;
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
+        self.backgroundColor = [UIColor colorWithRed:0.06 green:0.07 blue:0.11 alpha:0.96];
         self.layer.cornerRadius = 16;
+        self.layer.borderWidth = 1.2;
+        self.layer.borderColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.9].CGColor;
         self.clipsToBounds = YES;
+
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
         pan.delegate = self;
         [self addGestureRecognizer:pan];
 
         UIView *leftTab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 75, frame.size.height)];
-        leftTab.backgroundColor = [UIColor colorWithRed:0.75 green:0.88 blue:1.0 alpha:0.96];
+        leftTab.backgroundColor = [UIColor colorWithRed:0.12 green:0.15 blue:0.24 alpha:0.96];
         [self addSubview:leftTab];
 
-        NSArray *tabs = @[@"功能", @"调试"];
+        NSArray *tabs = @[@"功能", @"参数"];
         for (int i = 0; i < tabs.count; i++) {
             UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
             btn.frame = CGRectMake(5, 16 + i * 50, 65, 38);
             [btn setTitle:tabs[i] forState:UIControlStateNormal];
-            [btn setTitleColor:[UIColor colorWithRed:0.18 green:0.38 blue:0.78 alpha:1.0] forState:UIControlStateNormal];
+            [btn setTitleColor:[UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
             btn.titleLabel.font = [UIFont boldSystemFontOfSize:13.5];
-            btn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.75];
+            btn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.1];
             btn.layer.cornerRadius = 8;
             btn.tag = 200 + i;
             [btn addTarget:self action:@selector(tabClicked:) forControlEvents:UIControlEventTouchUpInside];
@@ -527,12 +393,10 @@ static NSTimeInterval g_lastTapStamp = 0;
 
         CGFloat rw = frame.size.width - 75;
         self.funcPageView = [[UIView alloc] initWithFrame:CGRectMake(75, 0, rw, frame.size.height)];
-        self.funcPageView.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.94];
         [self addSubview:self.funcPageView];
 
         self.debugPageView = [[UIScrollView alloc] initWithFrame:CGRectMake(75, 0, rw, frame.size.height)];
-        self.debugPageView.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.94];
-        self.debugPageView.contentSize = CGSizeMake(rw, 400);
+        self.debugPageView.contentSize = CGSizeMake(rw, 320);
         self.debugPageView.hidden = YES;
         [self addSubview:self.debugPageView];
 
@@ -548,79 +412,55 @@ static NSTimeInterval g_lastTapStamp = 0;
 }
 
 - (void)setupFuncPage {
-    UILabel *proc = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, self.funcPageView.frame.size.width - 24, 20)];
-    proc.text = @"声控物语 v12.0 (PC声卡模拟版)";
-    proc.textColor = [UIColor whiteColor];
-    proc.font = [UIFont systemFontOfSize:11];
+    UILabel *proc = [[UILabel alloc] initWithFrame:CGRectMake(10, 8, self.funcPageView.frame.size.width - 20, 20)];
+    proc.text = @"⚡ Studio One 机架磁力冲击波";
+    proc.textColor = [UIColor colorWithRed:0.4 green:0.85 blue:1.0 alpha:1.0];
+    proc.font = [UIFont boldSystemFontOfSize:11.5];
     proc.textAlignment = NSTextAlignmentCenter;
-    proc.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-    proc.layer.cornerRadius = 10;
-    proc.clipsToBounds = YES;
     [self.funcPageView addSubview:proc];
 
-    NSArray *titles = @[@"强制开麦", @"全房信号注入", @"Hyper二级增强", @"模拟电脑声卡", @"新清晰效果", @"旧清晰效果", @"超级震撼压制"];
+    NSArray *titles = @[@"强制开麦 (防静音)", @"动态磁力冲击波", @"5000+4000 轰炸模式"];
     for (int i = 0; i < titles.count; i++) {
-        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8, 30 + i * 32, self.funcPageView.frame.size.width - 16, 28)];
+        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8, 36 + i * 40, self.funcPageView.frame.size.width - 16, 32)];
         row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
-        row.layer.cornerRadius = 5;
+        row.layer.cornerRadius = 6;
         [self.funcPageView addSubview:row];
 
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 2, 140, 24)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 130, 24)];
         lbl.text = titles[i];
         lbl.textColor = [UIColor whiteColor];
         lbl.font = [UIFont boldSystemFontOfSize:11.5];
         [row addSubview:lbl];
 
-        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(row.frame.size.width - 48, 0, 40, 24)];
-        sw.transform = CGAffineTransformMakeScale(0.68, 0.68);
+        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(row.frame.size.width - 48, 2, 40, 24)];
+        sw.transform = CGAffineTransformMakeScale(0.72, 0.72);
         [sw addTarget:self action:@selector(onFuncSwitch:) forControlEvents:UIControlEventValueChanged];
         [row addSubview:sw];
 
         if (i == 0) { self.swForceMic = sw; [sw setOn:kForceOpenMic]; }
-        if (i == 1) { self.swInjection = sw; [sw setOn:kAudioInjection]; }
-        if (i == 2) { self.swHyper = sw; [sw setOn:kHyperEnhance]; }
-        if (i == 3) { self.swPCSoundCard = sw; [sw setOn:kPCSoundCardMode]; }
-        if (i == 4) self.swNewFight = sw;
-        if (i == 5) self.swOldFight = sw;
-        if (i == 6) { self.swSuperFight = sw; [sw setOn:YES]; }
+        if (i == 1) { self.swShockWave = sw; [sw setOn:kShockWaveEnabled]; }
+        if (i == 2) { self.swShockMode = sw; [sw setOn:YES]; }
     }
 }
 
 - (void)setupDebugPage {
-    NSArray *items = @[
-        @"新清晰音量 (默认400)",
-        @"旧清晰音量 (默认800)",
-        @"超级震撼增益 (至5000)",
-        @"人声动态权重 (至3.0)",
-        @"Hyper驱动强度 (至2.8)",
-        @"虚拟话放增益 (1.0~6.0)",
-        @"PC声卡立体声展宽 (1.0~2.5)",
-        @"PC声卡高频泛音 (0.5~2.0)",
-        @"PC声卡胸腔压迫 (0.5~2.0)"
-    ];
+    NSArray *items = @[@"冲击波能量 (默认4000)", @"人声主轨增益 (5000+)", @"磁力电流饱和度"];
     for (int i = 0; i < items.count; i++) {
-        CGFloat y = 8 + i * 58;
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, self.debugPageView.frame.size.width - 24, 16)];
+        CGFloat y = 8 + i * 62;
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10, y, self.debugPageView.frame.size.width - 20, 16)];
         lbl.text = items[i];
         lbl.textColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
         lbl.font = [UIFont boldSystemFontOfSize:11];
         [self.debugPageView addSubview:lbl];
 
-        UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(12, y + 18, self.debugPageView.frame.size.width - 24, 20)];
-        slider.tag = 500 + i;
-        if (i == 0) { slider.minimumValue = 100; slider.maximumValue = 1000; slider.value = kNewFightGain; }
-        if (i == 1) { slider.minimumValue = 300; slider.maximumValue = 1500; slider.value = kOldFightGain; }
-        if (i == 2) { slider.minimumValue = 500; slider.maximumValue = 5000; slider.value = kSuperFightGain; }
-        if (i == 3) { slider.minimumValue = 0.5; slider.maximumValue = 3.0;  slider.value = kVoiceGainRatio; }
-        if (i == 4) { slider.minimumValue = 1.0; slider.maximumValue = 2.8;  slider.value = kHyperDrive; }
-        if (i == 5) { slider.minimumValue = 1.0; slider.maximumValue = 6.0;  slider.value = kVirtualPreAmp; }
-        if (i == 6) { slider.minimumValue = 1.0; slider.maximumValue = 2.5;  slider.value = kPCSoundCardWidth; }
-        if (i == 7) { slider.minimumValue = 0.5; slider.maximumValue = 2.0;  slider.value = kPCSoundCardAir; }
-        if (i == 8) { slider.minimumValue = 0.5; slider.maximumValue = 2.0;  slider.value = kPCSoundCardChest; }
+        UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(10, y + 20, self.debugPageView.frame.size.width - 20, 20)];
+        slider.tag = 600 + i;
+        if (i == 0) { slider.minimumValue = 1000; slider.maximumValue = 6000; slider.value = kShockWaveIntensity; }
+        if (i == 1) { slider.minimumValue = 1.0;  slider.maximumValue = 3.0;  slider.value = kVoiceGainRatio; }
+        if (i == 2) { slider.minimumValue = 1.0;  slider.maximumValue = 4.0;  slider.value = kMagneticDrive; }
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
     }
-    self.debugPageView.contentSize = CGSizeMake(self.debugPageView.frame.size.width, 8 + items.count * 58 + 20);
 }
 
 - (void)tabClicked:(UIButton *)b {
@@ -629,44 +469,20 @@ static NSTimeInterval g_lastTapStamp = 0;
 }
 
 - (void)onSliderChanged:(UISlider *)s {
-    if (s.tag == 500) kNewFightGain = s.value;
-    if (s.tag == 501) kOldFightGain = s.value;
-    if (s.tag == 502) kSuperFightGain = s.value;
-    if (s.tag == 503) kVoiceGainRatio = s.value;
-    if (s.tag == 504) kHyperDrive = s.value;
-    if (s.tag == 505) kVirtualPreAmp = s.value;
-    if (s.tag == 506) kPCSoundCardWidth = s.value;
-    if (s.tag == 507) kPCSoundCardAir = s.value;
-    if (s.tag == 508) kPCSoundCardChest = s.value;
-    ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+    if (s.tag == 600) kShockWaveIntensity = s.value;
+    if (s.tag == 601) kVoiceGainRatio = s.value;
+    if (s.tag == 602) kMagneticDrive = s.value;
+    ApplyStudioOneProfile(g_activeZegoEngine);
 }
 
 - (void)onFuncSwitch:(UISwitch *)s {
     if (s == self.swForceMic) kForceOpenMic = s.isOn;
-    if (s == self.swInjection) {
-        kAudioInjection = s.isOn;
-        if (g_activeZegoEngine && [g_activeZegoEngine respondsToSelector:@selector(enableAux:)]) {
-            [g_activeZegoEngine enableAux:kAudioInjection];
-            if (kAudioInjection) [g_activeZegoEngine setAuxVolume:100];
-        }
+    if (s == self.swShockWave) kShockWaveEnabled = s.isOn;
+    if (s == self.swShockMode) {
+        if (s.isOn) kCurrentFightMode = FightMode_ShockWave;
+        else kCurrentFightMode = FightMode_Normal;
     }
-    if (s == self.swHyper) kHyperEnhance = s.isOn;
-    if (s == self.swPCSoundCard) {
-        kPCSoundCardMode = s.isOn;
-    }
-    if (s == self.swNewFight) {
-        if (s.isOn) { kCurrentFightMode = FightMode_New; [self.swOldFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
-        else { kCurrentFightMode = FightMode_Normal; }
-    }
-    if (s == self.swOldFight) {
-        if (s.isOn) { kCurrentFightMode = FightMode_Old; [self.swNewFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
-        else { kCurrentFightMode = FightMode_Normal; }
-    }
-    if (s == self.swSuperFight) {
-        if (s.isOn) { kCurrentFightMode = FightMode_Super; [self.swNewFight setOn:NO animated:YES]; [self.swOldFight setOn:NO animated:YES]; }
-        else { kCurrentFightMode = FightMode_Normal; }
-    }
-    ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
+    ApplyStudioOneProfile(g_activeZegoEngine);
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)p {
@@ -677,7 +493,7 @@ static NSTimeInterval g_lastTapStamp = 0;
 @end
 
 // ========================================================================
-// Part 7: 手势挂载与构造函数
+// Part 5: 双指双击手势与构造函数挂载
 // ========================================================================
 @interface HUDGestureHandler : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
@@ -713,7 +529,7 @@ static NSTimeInterval g_lastTapStamp = 0;
     g_lastTapStamp = now;
     UIWindow *targetWindow = GetKeyWindow();
     if (!g_hudInstance) {
-        g_hudInstance = [[BattleMasterHUD alloc] initWithFrame:CGRectMake(25, 120, 285, 260)];
+        g_hudInstance = [[BattleMasterHUD alloc] initWithFrame:CGRectMake(25, 120, 285, 210)];
         [targetWindow addSubview:g_hudInstance];
         return;
     }
