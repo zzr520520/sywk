@@ -4,9 +4,10 @@
 #import <AudioToolbox/AudioToolbox.h>
 
 // ========================================================================
-// v11.0.0: v8.5 Zego API 主控通道 + v10.0.0 HyperMaximizer2 二级增强层
+// v12.0.0: v8.5 Zego API 主控 + v10.0.0 HyperMaximizer2 + v12.0 PC 声卡模拟层
 // 核心策略：setCaptureVolume + setAudioEqualizerGain + 关3A = 主力生效通道
-//          AudioUnitRender HyperMaximizer2 = 二级增强（有则锦上添花）
+//          AudioUnitRender HyperMaximizer2 = 二级增强
+//          PCSoundCardMode = PC 端大声卡直推模拟（宽带胸腔 + 高频泛音 + 立体声展宽）
 // ========================================================================
 
 typedef enum : NSUInteger {
@@ -19,6 +20,7 @@ typedef enum : NSUInteger {
 static BOOL kForceOpenMic = YES;
 static BOOL kAudioInjection = NO;         // AUX 全房信号注入
 static BOOL kHyperEnhance = YES;          // HyperMaximizer2 二级增强开关
+static BOOL kPCSoundCardMode = NO;        // v12.0 模拟电脑声卡模式
 static FightAudioMode kCurrentFightMode = FightMode_Super;
 
 static float kNewFightGain = 400.0f;
@@ -27,6 +29,12 @@ static float kSuperFightGain = 3000.0f;
 static float kVoiceGainRatio = 1.2f;
 static float kHyperDrive = 2.0f;          // HyperMaximizer2 驱动强度
 static float kVirtualPreAmp = 4.5f;       // 虚拟话放暴力提权倍数（模拟硬件过载）
+
+// v12.0 PC 声卡模拟参数
+static float kPCSoundCardWidth = 1.6f;    // 立体声展宽系数 (1.0~2.5)
+static float kPCSoundCardAir = 1.0f;      // 高频泛音空气感强度 (0.5~2.0)
+static float kPCSoundCardChest = 1.0f;    // 宽带胸腔压迫感强度 (0.5~2.0)
+static int   kPCSoundCardBitrate = 128000; // PC 声卡模式码率
 
 static __weak id g_activeZegoEngine = nil;
 static __weak id g_activeZegoManager = nil;
@@ -187,6 +195,10 @@ static OSStatus hook_AudioUnitRender(AudioComponentInstance inUnit,
 - (bool)enableAGC:(bool)enable;
 - (bool)enableNoiseSuppress:(bool)enable;
 - (bool)enableAEC:(bool)enable;
+- (BOOL)setAudioChannelCount:(int)count;          // v12.0 声道数设置
+- (BOOL)setCaptureStereoSideGain:(float)gain;     // v12.0 立体声展宽
+- (BOOL)enableHeadphoneAEC:(BOOL)enable;          // v12.0 耳机回声消除
+- (BOOL)setVoiceChangerParam:(float)param type:(int)type; // v12.0 音效参数
 @end
 
 @interface ZegoAudioAux : NSObject
@@ -208,6 +220,7 @@ static OSStatus hook_AudioUnitRender(AudioComponentInstance inUnit,
 // ========================================================================
 // Part 3: v8.5 主力调音链（Zego SDK API）+ 清晰度优化 EQ
 // 核心生效路径：setCaptureVolume → setAudioEqualizerGain → 关3A
+// v12.0 新增：PC 声卡模拟层（立体声展宽 + 高频泛音 + 宽带胸腔 + 128kbps 全频带）
 // ========================================================================
 static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if (!zegoApi) return;
@@ -215,13 +228,16 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if ([zegoApi respondsToSelector:@selector(enableSpeaker:)]) [zegoApi enableSpeaker:YES];
     if (kForceOpenMic && [zegoApi respondsToSelector:@selector(enableMic:)]) [zegoApi enableMic:YES];
 
-    if (kCurrentFightMode == FightMode_Normal) {
+    if (kCurrentFightMode == FightMode_Normal && !kPCSoundCardMode) {
         if ([zegoApi respondsToSelector:@selector(enableAGC:)]) [zegoApi enableAGC:YES];
         if ([zegoApi respondsToSelector:@selector(enableNoiseSuppress:)]) [zegoApi enableNoiseSuppress:YES];
         if ([zegoApi respondsToSelector:@selector(enableAEC:)]) [zegoApi enableAEC:YES];
         if ([zegoApi respondsToSelector:@selector(setCaptureVolume:)]) [zegoApi setCaptureVolume:100];
         if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
             for (int i = 0; i < 10; i++) [zegoApi setAudioEqualizerGain:0.0f index:i];
+        }
+        if ([zegoApi respondsToSelector:@selector(setAudioBitrate:)]) {
+            [zegoApi setAudioBitrate:48000];
         }
         return;
     }
@@ -240,9 +256,23 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
         [zegoApi setCaptureVolume:finalVolume];
     }
 
-    // 128kbps 全频带高码率（v10.0.0 新增）
+    // 码率设置：PC 声卡模式强制 128kbps 全频带音乐场景
     if ([zegoApi respondsToSelector:@selector(setAudioBitrate:)]) {
-        [zegoApi setAudioBitrate:128000];
+        int bitrate = kPCSoundCardMode ? kPCSoundCardBitrate : 128000;
+        [zegoApi setAudioBitrate:bitrate];
+    }
+
+    // v12.0 PC 声卡模拟：双声道立体声驱动
+    if (kPCSoundCardMode) {
+        if ([zegoApi respondsToSelector:@selector(setAudioChannelCount:)]) {
+            [zegoApi setAudioChannelCount:2];  // 强制双声道立体声
+        }
+        if ([zegoApi respondsToSelector:@selector(setCaptureStereoSideGain:)]) {
+            [zegoApi setCaptureStereoSideGain:kPCSoundCardWidth];
+        }
+        if ([zegoApi respondsToSelector:@selector(enableHeadphoneAEC:)]) {
+            [zegoApi enableHeadphoneAEC:NO];  // 解除底噪抑制，释放全频带动态
+        }
     }
 
     // AUX 混音注入
@@ -257,40 +287,46 @@ static void ApplyCrystalLoudVoiceDSP(id zegoApi) {
     if ([zegoApi respondsToSelector:@selector(setAudioEqualizerGain:index:)]) {
         if (kCurrentFightMode == FightMode_New) {
             // 新清晰：齿音穿透，中低频适度削减防糊
+            float airBoost = kPCSoundCardMode ? (4.0f * kPCSoundCardAir) : 0.0f;
+            float chestBoost = kPCSoundCardMode ? (2.0f * kPCSoundCardChest) : 0.0f;
             [zegoApi setAudioEqualizerGain:-10.0f index:0]; // 31Hz
             [zegoApi setAudioEqualizerGain:-6.0f  index:1]; // 62Hz
-            [zegoApi setAudioEqualizerGain:-2.0f  index:2]; // 125Hz
+            [zegoApi setAudioEqualizerGain:-2.0f + chestBoost index:2]; // 125Hz
             [zegoApi setAudioEqualizerGain:-8.0f  index:3]; // 250Hz 削浑浊
             [zegoApi setAudioEqualizerGain:-10.0f index:4]; // 500Hz 削闷
             [zegoApi setAudioEqualizerGain:14.0f  index:5]; // 1kHz 咬字
             [zegoApi setAudioEqualizerGain:22.0f  index:6]; // 2kHz 穿透
             [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz 极致清晰
-            [zegoApi setAudioEqualizerGain:18.0f  index:8]; // 8kHz 泛音明亮
-            [zegoApi setAudioEqualizerGain:12.0f  index:9]; // 16kHz 空气感
+            [zegoApi setAudioEqualizerGain:18.0f + airBoost index:8]; // 8kHz 泛音明亮
+            [zegoApi setAudioEqualizerGain:12.0f + airBoost * 0.8f index:9]; // 16kHz 空气感
         } else if (kCurrentFightMode == FightMode_Old) {
             // 旧清晰：饱满浑厚，中低频适度保留
+            float airBoost = kPCSoundCardMode ? (4.0f * kPCSoundCardAir) : 0.0f;
+            float chestBoost = kPCSoundCardMode ? (3.0f * kPCSoundCardChest) : 0.0f;
             [zegoApi setAudioEqualizerGain:-4.0f  index:0]; // 31Hz
-            [zegoApi setAudioEqualizerGain:6.0f   index:1]; // 62Hz
-            [zegoApi setAudioEqualizerGain:10.0f  index:2]; // 125Hz 胸腔
+            [zegoApi setAudioEqualizerGain:6.0f + chestBoost * 0.5f index:1]; // 62Hz
+            [zegoApi setAudioEqualizerGain:10.0f + chestBoost index:2]; // 125Hz 胸腔
             [zegoApi setAudioEqualizerGain:-2.0f  index:3]; // 250Hz 微削
             [zegoApi setAudioEqualizerGain:-4.0f  index:4]; // 500Hz 削闷
             [zegoApi setAudioEqualizerGain:16.0f  index:5]; // 1kHz
             [zegoApi setAudioEqualizerGain:24.0f  index:6]; // 2kHz
             [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz
-            [zegoApi setAudioEqualizerGain:20.0f  index:8]; // 8kHz
-            [zegoApi setAudioEqualizerGain:14.0f  index:9]; // 16kHz
+            [zegoApi setAudioEqualizerGain:20.0f + airBoost index:8]; // 8kHz
+            [zegoApi setAudioEqualizerGain:14.0f + airBoost * 0.8f index:9]; // 16kHz
         } else if (kCurrentFightMode == FightMode_Super) {
             // 震撼超级压制：胸腔共鸣 + 极致清晰穿透（清晰度优化版）
-            [zegoApi setAudioEqualizerGain:4.0f   index:0]; // 31Hz 微增
-            [zegoApi setAudioEqualizerGain:12.0f  index:1]; // 62Hz 冲击力
-            [zegoApi setAudioEqualizerGain:18.0f  index:2]; // 125Hz 胸腔厚重共鸣
-            [zegoApi setAudioEqualizerGain:6.0f   index:3]; // 250Hz 适度饱满（降低防浑浊）
+            float airBoost = kPCSoundCardMode ? (6.0f * kPCSoundCardAir) : 0.0f;
+            float chestBoost = kPCSoundCardMode ? (4.0f * kPCSoundCardChest) : 0.0f;
+            [zegoApi setAudioEqualizerGain:4.0f + chestBoost * 0.3f index:0]; // 31Hz 微增
+            [zegoApi setAudioEqualizerGain:12.0f + chestBoost * 0.6f index:1]; // 62Hz 冲击力
+            [zegoApi setAudioEqualizerGain:18.0f + chestBoost index:2]; // 125Hz 胸腔厚重共鸣
+            [zegoApi setAudioEqualizerGain:6.0f + chestBoost * 0.4f index:3]; // 250Hz 适度饱满（降低防浑浊）
             [zegoApi setAudioEqualizerGain:2.0f   index:4]; // 500Hz 微增（降低防闷）
             [zegoApi setAudioEqualizerGain:24.0f  index:5]; // 1kHz 咬字清晰（顶格）
             [zegoApi setAudioEqualizerGain:24.0f  index:6]; // 2kHz 穿透压制（顶格）
             [zegoApi setAudioEqualizerGain:24.0f  index:7]; // 4kHz 声学掩蔽（顶格）
-            [zegoApi setAudioEqualizerGain:22.0f  index:8]; // 8kHz 泛音明亮（提升清晰度）
-            [zegoApi setAudioEqualizerGain:16.0f  index:9]; // 16kHz 空气感
+            [zegoApi setAudioEqualizerGain:22.0f + airBoost index:8]; // 8kHz 泛音明亮（提升清晰度）
+            [zegoApi setAudioEqualizerGain:16.0f + airBoost * 0.8f index:9]; // 16kHz 空气感
         }
     }
 }
@@ -452,6 +488,7 @@ static UIWindow *GetKeyWindow(void) {
 @property (nonatomic, strong) UISwitch *swForceMic;
 @property (nonatomic, strong) UISwitch *swInjection;
 @property (nonatomic, strong) UISwitch *swHyper;
+@property (nonatomic, strong) UISwitch *swPCSoundCard;  // v12.0 模拟电脑声卡
 @property (nonatomic, strong) UISwitch *swNewFight;
 @property (nonatomic, strong) UISwitch *swOldFight;
 @property (nonatomic, strong) UISwitch *swSuperFight;
@@ -512,7 +549,7 @@ static NSTimeInterval g_lastTapStamp = 0;
 
 - (void)setupFuncPage {
     UILabel *proc = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, self.funcPageView.frame.size.width - 24, 20)];
-    proc.text = @"声控物语 v11.0 (Zego API 主控)";
+    proc.text = @"声控物语 v12.0 (PC声卡模拟版)";
     proc.textColor = [UIColor whiteColor];
     proc.font = [UIFont systemFontOfSize:11];
     proc.textAlignment = NSTextAlignmentCenter;
@@ -521,14 +558,14 @@ static NSTimeInterval g_lastTapStamp = 0;
     proc.clipsToBounds = YES;
     [self.funcPageView addSubview:proc];
 
-    NSArray *titles = @[@"强制开麦", @"全房信号注入", @"Hyper二级增强", @"新清晰效果", @"旧清晰效果", @"超级震撼压制"];
+    NSArray *titles = @[@"强制开麦", @"全房信号注入", @"Hyper二级增强", @"模拟电脑声卡", @"新清晰效果", @"旧清晰效果", @"超级震撼压制"];
     for (int i = 0; i < titles.count; i++) {
         UIView *row = [[UIView alloc] initWithFrame:CGRectMake(8, 30 + i * 32, self.funcPageView.frame.size.width - 16, 28)];
         row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
         row.layer.cornerRadius = 5;
         [self.funcPageView addSubview:row];
 
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 2, 120, 24)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 2, 140, 24)];
         lbl.text = titles[i];
         lbl.textColor = [UIColor whiteColor];
         lbl.font = [UIFont boldSystemFontOfSize:11.5];
@@ -542,14 +579,25 @@ static NSTimeInterval g_lastTapStamp = 0;
         if (i == 0) { self.swForceMic = sw; [sw setOn:kForceOpenMic]; }
         if (i == 1) { self.swInjection = sw; [sw setOn:kAudioInjection]; }
         if (i == 2) { self.swHyper = sw; [sw setOn:kHyperEnhance]; }
-        if (i == 3) self.swNewFight = sw;
-        if (i == 4) self.swOldFight = sw;
-        if (i == 5) { self.swSuperFight = sw; [sw setOn:YES]; }
+        if (i == 3) { self.swPCSoundCard = sw; [sw setOn:kPCSoundCardMode]; }
+        if (i == 4) self.swNewFight = sw;
+        if (i == 5) self.swOldFight = sw;
+        if (i == 6) { self.swSuperFight = sw; [sw setOn:YES]; }
     }
 }
 
 - (void)setupDebugPage {
-    NSArray *items = @[@"新清晰音量 (默认400)", @"旧清晰音量 (默认800)", @"超级震撼增益 (至5000)", @"人声动态权重 (至3.0)", @"Hyper驱动强度 (至2.8)", @"虚拟话放增益 (1.0~6.0)"];
+    NSArray *items = @[
+        @"新清晰音量 (默认400)",
+        @"旧清晰音量 (默认800)",
+        @"超级震撼增益 (至5000)",
+        @"人声动态权重 (至3.0)",
+        @"Hyper驱动强度 (至2.8)",
+        @"虚拟话放增益 (1.0~6.0)",
+        @"PC声卡立体声展宽 (1.0~2.5)",
+        @"PC声卡高频泛音 (0.5~2.0)",
+        @"PC声卡胸腔压迫 (0.5~2.0)"
+    ];
     for (int i = 0; i < items.count; i++) {
         CGFloat y = 8 + i * 58;
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, self.debugPageView.frame.size.width - 24, 16)];
@@ -566,9 +614,13 @@ static NSTimeInterval g_lastTapStamp = 0;
         if (i == 3) { slider.minimumValue = 0.5; slider.maximumValue = 3.0;  slider.value = kVoiceGainRatio; }
         if (i == 4) { slider.minimumValue = 1.0; slider.maximumValue = 2.8;  slider.value = kHyperDrive; }
         if (i == 5) { slider.minimumValue = 1.0; slider.maximumValue = 6.0;  slider.value = kVirtualPreAmp; }
+        if (i == 6) { slider.minimumValue = 1.0; slider.maximumValue = 2.5;  slider.value = kPCSoundCardWidth; }
+        if (i == 7) { slider.minimumValue = 0.5; slider.maximumValue = 2.0;  slider.value = kPCSoundCardAir; }
+        if (i == 8) { slider.minimumValue = 0.5; slider.maximumValue = 2.0;  slider.value = kPCSoundCardChest; }
         [slider addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
         [self.debugPageView addSubview:slider];
     }
+    self.debugPageView.contentSize = CGSizeMake(self.debugPageView.frame.size.width, 8 + items.count * 58 + 20);
 }
 
 - (void)tabClicked:(UIButton *)b {
@@ -583,6 +635,9 @@ static NSTimeInterval g_lastTapStamp = 0;
     if (s.tag == 503) kVoiceGainRatio = s.value;
     if (s.tag == 504) kHyperDrive = s.value;
     if (s.tag == 505) kVirtualPreAmp = s.value;
+    if (s.tag == 506) kPCSoundCardWidth = s.value;
+    if (s.tag == 507) kPCSoundCardAir = s.value;
+    if (s.tag == 508) kPCSoundCardChest = s.value;
     ApplyCrystalLoudVoiceDSP(g_activeZegoEngine);
 }
 
@@ -596,6 +651,9 @@ static NSTimeInterval g_lastTapStamp = 0;
         }
     }
     if (s == self.swHyper) kHyperEnhance = s.isOn;
+    if (s == self.swPCSoundCard) {
+        kPCSoundCardMode = s.isOn;
+    }
     if (s == self.swNewFight) {
         if (s.isOn) { kCurrentFightMode = FightMode_New; [self.swOldFight setOn:NO animated:YES]; [self.swSuperFight setOn:NO animated:YES]; }
         else { kCurrentFightMode = FightMode_Normal; }
@@ -655,7 +713,7 @@ static NSTimeInterval g_lastTapStamp = 0;
     g_lastTapStamp = now;
     UIWindow *targetWindow = GetKeyWindow();
     if (!g_hudInstance) {
-        g_hudInstance = [[BattleMasterHUD alloc] initWithFrame:CGRectMake(25, 120, 285, 230)];
+        g_hudInstance = [[BattleMasterHUD alloc] initWithFrame:CGRectMake(25, 120, 285, 260)];
         [targetWindow addSubview:g_hudInstance];
         return;
     }
